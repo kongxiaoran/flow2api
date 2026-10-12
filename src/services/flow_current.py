@@ -5,6 +5,7 @@ batchexecute.  This mixin overrides every runtime path that previously called
 the retired Labs tRPC and AI Sandbox REST endpoints.
 """
 
+import os
 import base64
 import re
 import time
@@ -373,8 +374,21 @@ class CurrentFlowClientMixin:
                 if progress_callback:
                     await progress_callback("solving_image_captcha", 38)
                 personal_mode = config.captcha_method == "personal"
+                # Link 补丁（2026-10-12）：PERSONAL_IMAGE_VIA_OGIZ0B=1 时 personal 生图不走
+                # StreamChat（Agent 通道当前对该请求返回空结果），改用浏览器 trusted token
+                # （action=IMAGE_GENERATION）+ ogiZ0b，与 flow-proto-go image-proto 实测一致。
+                link_personal_ogiz0b = (
+                    personal_mode
+                    and os.environ.get("PERSONAL_IMAGE_VIA_OGIZ0B", "").strip() == "1"
+                )
+                # NARWHAL 在 ogiZ0b 上返回 [5] NOT_FOUND；Flow 前端当前对应的模型键是 BELUGA（实测出图）。
+                if link_personal_ogiz0b and str(model_name or "").upper() == "NARWHAL":
+                    model_name = (
+                        os.environ.get("PERSONAL_NARWHAL_MODEL_KEY", "").strip() or "BELUGA"
+                    )
                 personal_native_compatible = (
                     personal_mode
+                    and not link_personal_ogiz0b
                     and not image_inputs
                     and str(model_name or "").upper() == "NARWHAL"
                     and str(aspect_ratio or "").upper()
@@ -457,7 +471,7 @@ class CurrentFlowClientMixin:
                 #   走原 ogiZ0b 链路，action 保持上游既有的 IMAGE_GENERATION。
                 captcha_override = (
                     self._resolve_batchexecute_captcha_override()
-                    if personal_mode
+                    if personal_mode and not link_personal_ogiz0b
                     else None
                 )
                 stream_transport = config.captcha_method == "browser"

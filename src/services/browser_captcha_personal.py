@@ -851,10 +851,19 @@ def _tune_personal_browser_args_for_docker_headed(
         [
             "--window-size=1366,768",
             "--window-position=40,40",
-            "--lang=zh-CN",
+            # Link patch: 语言跟随对齐设置（容器 locale 与 en-US 画像曾矛盾）
+            ("--lang=en-US" if os.environ.get("PERSONAL_FORCE_EN_US", "").strip().lower() in {"1", "true", "yes"} else "--lang=zh-CN"),
             "--password-store=basic",
             "--ozone-platform=x11",
-            "--use-gl=swiftshader",
+            # Link patch（2026-10-11）：修复容器内 WebGL 完全不可用。
+            # 该函数会移除基础参数里的 --disable-gpu，但没有加回任何 GL 参数；
+            # 而 Chrome 137+ 起单独 --use-gl=swiftshader 已不再启用 WebGL，
+            # 必须显式给 --enable-unsafe-swiftshader（实测 getContext("webgl") 才返回非 null）。
+            # 否则「声明 macOS + Apple M1 Max 却完全没有 WebGL」是极强的不自然信号，
+            # 且 WebGL 伪装补丁因无对象可作用而完全失效。
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--enable-unsafe-swiftshader",
         ]
     )
     return tuned_args
@@ -3636,6 +3645,11 @@ class BrowserCaptchaService:
             f"{self._runtime_fingerprint_spoof_seed}:{self._browser_instance_id}:runtime-surface"
         ).encode("utf-8")
         digest = hashlib.sha256(seed_material).digest()
+        # Link patch: 指纹对齐 —— 强制 macOS/Chrome UA，使 _derive_runtime_os_profile
+        # 选择 macOS 分支，避免与下面的 Apple GPU 伪装互相矛盾。
+        _link_ua_override = os.environ.get("PERSONAL_FORCE_UA", "").strip()
+        if _link_ua_override:
+            user_agent = _link_ua_override
         full_version = self._parse_runtime_browser_version(user_agent, product)
         major_version = full_version.split(".", 1)[0]
         effective_user_agent = str(user_agent or "").strip() or (
@@ -3643,6 +3657,17 @@ class BrowserCaptchaService:
             f"(KHTML, like Gecko) Chrome/{full_version} Safari/537.36"
         )
         os_profile = self._derive_runtime_os_profile(effective_user_agent)
+        # Link patch: 强制 macOS 客户端提示与 js platform，与 PERSONAL_FORCE_UA 配套。
+        if os.environ.get("PERSONAL_FORCE_MACOS", "").strip().lower() in {"1", "true", "yes"}:
+            os_profile = {
+                "ua_ch_platform": "macOS",
+                "ua_ch_platform_version": "14.0.0",
+                "js_platform": "MacIntel",
+                "vendor": "Google Inc.",
+                "architecture": "x86",
+                "bitness": "64",
+                "wow64": False,
+            }
 
         locale_profiles = (
             {
@@ -3702,6 +3727,9 @@ class BrowserCaptchaService:
             },
         )
         locale_profile = dict(locale_profiles[digest[2] % len(locale_profiles)])
+        # Link patch: 固定 locale/时区/地理，与账号画像（HubStudio 按 IP 匹配）一致。
+        if os.environ.get("PERSONAL_FORCE_EN_US", "").strip().lower() in {"1", "true", "yes"}:
+            locale_profile = dict(locale_profiles[1])  # en-US / America/New_York
         desktop_profiles = (
             {"width": 1366, "height": 768, "hardwareConcurrency": 4, "deviceMemory": 4},
             {"width": 1440, "height": 900, "hardwareConcurrency": 8, "deviceMemory": 8},
@@ -3726,6 +3754,19 @@ class BrowserCaptchaService:
             },
         )
         base_profile = dict(desktop_profiles[digest[0] % len(desktop_profiles)])
+        # Link patch: 固定屏幕与核心数（对齐 HubStudio：2560x1440 / 6 核 / 8GB）。
+        _link_screen = os.environ.get("PERSONAL_FORCE_SCREEN", "").strip()
+        if _link_screen:
+            try:
+                _w, _h = (int(x) for x in _link_screen.lower().split("x", 1))
+                _cores = int(os.environ.get("PERSONAL_FORCE_CORES", "6") or 6)
+                _mem = int(os.environ.get("PERSONAL_FORCE_MEMORY", "8") or 8)
+                base_profile = {
+                    "width": _w, "height": _h,
+                    "hardwareConcurrency": _cores, "deviceMemory": _mem,
+                }
+            except Exception:
+                pass
         gpu_profiles = (
             {
                 "vendor": "Google Inc. (Intel)",
@@ -3747,6 +3788,16 @@ class BrowserCaptchaService:
             },
         )
         gpu_profile = dict(gpu_profiles[digest[11] % len(gpu_profiles)])
+        # Link patch: GPU 与 macOS UA 保持自洽。
+        # 上游给的三个假值全是 Windows Direct3D11（Intel UHD 620 / GTX 1650 / AMD），
+        # 而此处 UA 是 Macintosh —— Linux 容器上出现 D3D11 本身就是伪造特征。
+        if os.environ.get("PERSONAL_FORCE_APPLE_GPU", "").strip().lower() in {"1", "true", "yes"}:
+            gpu_profile = {
+                "vendor": "Google Inc. (Apple)",
+                "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Max, Unspecified Version)",
+                "unmaskedVendor": "Apple Inc.",
+                "unmaskedRenderer": "Apple M1 Max",
+            }
         gpu_arch = "turing"
         if "Intel" in str(
             gpu_profile.get("unmaskedVendor") or gpu_profile.get("vendor") or ""
@@ -3935,18 +3986,36 @@ class BrowserCaptchaService:
                 },
             },
             "font": {
-                "families": [
-                    "Arial",
-                    "Calibri",
-                    "Cambria",
-                    "Consolas",
-                    "Courier New",
-                    "Georgia",
-                    "Microsoft YaHei",
-                    "Segoe UI",
-                    "Times New Roman",
-                    "Verdana",
-                ],
+                # Link patch: 字体清单跟随 OS profile。
+                # 上游这里是硬编码的 Windows 字体（Calibri/Cambria/Consolas/
+                # Microsoft YaHei/Segoe UI），与 macOS 伪装自相矛盾。
+                "families": (
+                    [
+                        "American Typewriter", "Andale Mono", "Arial", "Arial Black",
+                        "Arial Narrow", "Arial Rounded MT Bold", "Arial Unicode MS",
+                        "Ayuthaya", "Baghdad", "Baskerville", "BiauKai", "Big Caslon",
+                        "Blackadder ITC", "Book Antiqua", "Bookman Old Style",
+                        "Bradley Hand", "Brush Script MT", "Chalkboard", "Charcoal",
+                        "Cochin", "Comic Sans MS", "Copperplate", "Corsiva Hebrew",
+                        "Courier", "Courier New", "Gadget", "Geeza Pro", "Geneva",
+                        "Georgia", "Gill Sans", "Heiti SC", "Heiti TC", "Helvetica",
+                        "Helvetica Neue", "Herculanum", "Hiragino Kaku Gothic Pro",
+                        "Hiragino Mincho Pro", "Hiragino Sans", "Hoefler Text",
+                        "Impact", "Lucida Grande", "Luminari", "Marker Felt",
+                        "Menlo", "Microsoft Sans Serif", "Monaco", "Mshtakan",
+                        "Nadeem", "New Peninim MT", "Optima", "Papyrus", "Phosphate",
+                        "PingFang SC", "PingFang TC", "Raanana", "Rockwell",
+                        "San Francisco", "Sathu", "Silom", "Skia", "Snell Roundhand",
+                        "Songti SC", "STHeiti", "Tahoma", "Thonburi", "Times",
+                        "Times New Roman", "Trebuchet MS", "Verdana", "Zapfino",
+                    ]
+                    if os_profile.get("ua_ch_platform") == "macOS"
+                    else [
+                        "Arial", "Calibri", "Cambria", "Consolas", "Courier New",
+                        "Georgia", "Microsoft YaHei", "Segoe UI",
+                        "Times New Roman", "Verdana",
+                    ]
+                ),
             },
             "userAgentMetadata": {
                 "platform": str(os_profile["ua_ch_platform"]),
@@ -5905,6 +5974,11 @@ class BrowserCaptchaService:
                 timeout_seconds=5.0,
                 return_by_value=True,
             )
+            if os.environ.get("PERSONAL_DISABLE_SURFACE_SPOOF", "").strip().lower() in {"1", "true", "yes"}:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Link patch: 跳过 Canvas/WebGL/Audio 补齐脚本 (label={label})"
+                )
+                return True
             await self._run_with_timeout(
                 tab.send(
                     cdp.page.add_script_to_evaluate_on_new_document(
@@ -7005,6 +7079,30 @@ class BrowserCaptchaService:
                 return
             seen.add(stable_key)
             expanded.append(cookie)
+
+        # Link 补丁（2026-10-12）：PERSONAL_DISABLE_COOKIE_MIRROR=1 时不再把会话 Cookie
+        # 镜像成 www.google.com / www.recaptcha.net 的 host-only 副本。真实浏览器里
+        # recaptcha.net 不会带 Google 登录 Cookie，这些副本会让 reCAPTCHA 给出低分 token
+        # （实测 590/618 -> PUBLIC_ERROR_UNUSUAL_ACTIVITY；去掉后 2468，出图成功）。
+        # 同时丢弃 token.google_cookies 里历史回填的镜像副本（在其他域上有同名原件）。
+        if os.environ.get("PERSONAL_DISABLE_COOKIE_MIRROR", "").strip() == "1":
+            mirror_hosts = {"www.google.com", "www.recaptcha.net"}
+            parent_names = {
+                str(c.get("name") or "")
+                for c in browser_cookies
+                if cls._extract_cookie_scope_host(c) not in mirror_hosts
+            }
+            for cookie in browser_cookies:
+                scope_host = cls._extract_cookie_scope_host(cookie)
+                domain = str(cookie.get("domain") or "").strip()
+                if (
+                    not domain.startswith(".")
+                    and scope_host in mirror_hosts
+                    and str(cookie.get("name") or "") in parent_names
+                ):
+                    continue
+                append_cookie(cookie)
+            return expanded
 
         for cookie in browser_cookies:
             scope_host = cls._extract_cookie_scope_host(cookie)
@@ -10311,6 +10409,18 @@ class BrowserCaptchaService:
                         "browser_args": browser_args,
                         "sandbox": sandbox_enabled,
                     }
+                    # Link patch: 连接外部已有浏览器（如 HubStudio 窗口）而不是在容器内启动
+                    remote_cdp_port = os.environ.get("PERSONAL_BROWSER_CDP_PORT", "").strip()
+                    if remote_cdp_port:
+                        launch_kwargs = dict(
+                            launch_kwargs,
+                            host=os.environ.get("PERSONAL_BROWSER_CDP_HOST", "127.0.0.1").strip(),
+                            port=int(remote_cdp_port),
+                        )
+                        debug_logger.log_info(
+                            "[BrowserCaptcha] Link patch: 连接外部浏览器 "
+                            + str(launch_kwargs["host"]) + ":" + remote_cdp_port
+                        )
                     launch_config = uc.Config(**launch_kwargs)
                     effective_launch_args = launch_config()
                     debug_logger.log_info(
@@ -10347,6 +10457,14 @@ class BrowserCaptchaService:
                                 timeout_seconds=30.0,
                                 label=launch_label,
                             )
+                            if os.environ.get("PERSONAL_BROWSER_CDP_PORT", "").strip() and getattr(self.browser, "_process", None) is None:
+                                # Link patch: 外部浏览器没有本地进程，nodriver 的 stopped 会恒为 True；
+                                # 挂一个哑进程对象，terminate/kill 为空操作，绝不关闭外部浏览器。
+                                import types as _link_types
+                                self.browser._process = _link_types.SimpleNamespace(
+                                    returncode=None, pid=None,
+                                    terminate=lambda: None, kill=lambda: None,
+                                )
                             self._browser_process_pid = self._get_browser_process_pid(
                                 self.browser
                             )
@@ -11415,10 +11533,15 @@ class BrowserCaptchaService:
         """
         normalized_action = str(action or "IMAGE_GENERATION").strip().upper()
         normalized_project_id = str(project_id or "").strip()
-        if normalized_action != "CHAT_GENERATION" or not normalized_project_id:
+        # Link 补丁（2026-10-12）：PERSONAL_IMAGE_VIA_OGIZ0B=1 时 IMAGE/VIDEO_GENERATION 也先
+        # 重新打开项目页，让 bind 钩子捕获未被劫持的 execute（否则 trusted JS 取码超时）。
+        nav_actions = {"CHAT_GENERATION"}
+        if os.environ.get("PERSONAL_IMAGE_VIA_OGIZ0B", "").strip() == "1":
+            nav_actions |= {"IMAGE_GENERATION", "VIDEO_GENERATION"}
+        if normalized_action not in nav_actions or not normalized_project_id:
             await self._wait_for_recaptcha(tab)
 
-        if normalized_action == "CHAT_GENERATION" and normalized_project_id:
+        if normalized_action in nav_actions and normalized_project_id:
             await self._apply_trusted_recaptcha_hook(
                 tab, label=f"direct_project:{normalized_project_id}"
             )
@@ -11909,6 +12032,10 @@ class BrowserCaptchaService:
             raise RuntimeError("personal browser StreamChat returned an invalid payload")
         status = int(result.get("status") or 0)
         text = str(result.get("text") or "")
+        # Link 诊断（2026-10-12）：记录 StreamChat 响应开头，排查 no generated media
+        debug_logger.log_info(
+            f"[BrowserCaptcha] StreamChat 响应 status={status} len={len(text)} head={text[:600]!r}"
+        )
         if status < 200 or status >= 300:
             raise RuntimeError(
                 f"personal browser StreamChat failed: HTTP {status}, body={text[:300]}"
