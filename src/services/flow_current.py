@@ -5,6 +5,7 @@ batchexecute.  This mixin overrides every runtime path that previously called
 the retired Labs tRPC and AI Sandbox REST endpoints.
 """
 
+import json
 import os
 import base64
 import re
@@ -731,6 +732,32 @@ class CurrentFlowClientMixin:
                     project_id=project_id,
                     timeout=max(self._get_video_submit_timeout(), 90),
                 )
+                upsampled_id = f"{str(video_media_id or '').strip()}_upsampled"
+                if (
+                    str(mode or "").strip().lower() == "upsample"
+                    and os.environ.get("FLOW_VIDEO_UPSAMPLE_WEB_LAYOUT", "").strip() == "1"
+                    and upsampled_id in json.dumps(payload, ensure_ascii=False)
+                ):
+                    # Link 补丁（2026-10-12）：p0UkFb 只回 [[["<src>_upsampled"],...]]，没有
+                    # [id, projectId, workflowId] 记录；直接以该 id 建任务，交给 jwpduf/as29s 轮询。
+                    # 否则会被判为“无生成任务”并重试，重试撞上 GENERATION_ALREADY_IN_PROGRESS。
+                    debug_logger.log_info(f"[UPSAMPLE] 已提交放大任务 {upsampled_id}")
+                    return {
+                        "operations": [
+                            {
+                                "operation": {"name": upsampled_id},
+                                "name": upsampled_id,
+                                "mediaName": upsampled_id,
+                                "projectId": project_id,
+                                "status": "MEDIA_GENERATION_STATUS_ACTIVE",
+                                "aspectRatio": aspect_ratio,
+                                "modelKey": model_key,
+                                "frontendRpc": rpc_id,
+                            }
+                        ],
+                        "projectId": project_id,
+                        "frontendRpc": rpc_id,
+                    }
                 return self._normalize_frontend_video_submission(
                     payload,
                     project_id=project_id,

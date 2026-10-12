@@ -276,6 +276,18 @@ class FlowFrontendMixin:
         return ""
 
     @staticmethod
+    def _is_frontend_video_operation_id(value: Any) -> bool:
+        # Link 补丁（2026-10-12）：视频放大任务 id 为 "<源视频 id>_upsampled"。
+        if FlowFrontendMixin._is_uuid(value):
+            return True
+        return bool(
+            os.environ.get("FLOW_VIDEO_UPSAMPLE_WEB_LAYOUT", "").strip() == "1"
+            and isinstance(value, str)
+            and value.endswith("_upsampled")
+            and FlowFrontendMixin._is_uuid(value[: -len("_upsampled")])
+        )
+
+    @staticmethod
     def _is_uuid(value: Any) -> bool:
         return bool(
             isinstance(value, str)
@@ -468,7 +480,7 @@ class FlowFrontendMixin:
             if isinstance(value, list):
                 if (
                     len(value) >= 3
-                    and cls._is_uuid(value[0])
+                    and cls._is_frontend_video_operation_id(value[0])
                     and (project_id is None or str(value[1] or "") == project_id)
                     and cls._is_uuid(value[2])
                 ):
@@ -567,6 +579,9 @@ class FlowFrontendMixin:
                 if len(record) > 2 and cls._is_uuid(record[2])
                 else str((previous or {}).get("mediaName") or operation_id)
             )
+            if operation_id.endswith("_upsampled"):
+                # 放大结果的 record[2] 是 workflowId，as29s 需用任务 id 本身取 /video/ 直链
+                media_name = operation_id
             video_url = cls._find_flow_content_url(record, "video")
             error_code = cls._extract_frontend_rpc_error_code(record)
             status = "MEDIA_GENERATION_STATUS_SUCCESSFUL" if video_url else (
