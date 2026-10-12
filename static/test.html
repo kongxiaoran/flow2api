@@ -172,102 +172,48 @@ const STATE = { selectedModel: null, modelConfig: null, images: [], generating: 
 </script>
 <script>
 // Model categories for sidebar
+// 当前公开模型名为连字符格式（veo-3.1-fast-8s-landscape）；旧下划线名（veo_3_1_t2v_*）仍保留分组以兼容老服务。
+// 没有被任何分组认领的模型会进入末尾的“其他”，不会再被静默丢弃。
+const ASPECTS = ["landscape", "portrait", "square", "four-three", "three-four"];
+const ASPECT_LABEL = {
+  "landscape": "横屏 16:9", "portrait": "竖屏 9:16", "square": "方图 1:1",
+  "four-three": "横屏 4:3", "three-four": "竖屏 3:4",
+};
+const isLegacyUpsample = m => /^veo_3_1_/.test(m) && /(4k|1080p)$/.test(m);
+const isLegacyVideo = (m, kind) => m.startsWith("veo_3_1_" + kind) && !isLegacyUpsample(m);
+
 const MODEL_CATEGORIES = {
   "Gemini 3.1 Flash 图片": { filter: m => m.startsWith("gemini-3.1-flash-image") },
   "Gemini 3.0 Pro 图片": { filter: m => m.startsWith("gemini-3.0-pro-image") },
   "Imagen 4.0 图片": { filter: m => m.startsWith("imagen-4.0") },
-  "Veo 3.1 文生视频 (T2V)": { filter: m => m.startsWith("veo_3_1_t2v") && !m.includes("4k") && !m.includes("1080p") },
-  "Veo 3.1 图生视频 (I2V)": { filter: m => m.startsWith("veo_3_1_i2v") && !m.includes("4k") && !m.includes("1080p") },
-  "Veo 3.1 多图视频 (R2V)": { filter: m => m.startsWith("veo_3_1_r2v") && !m.includes("4k") && !m.includes("1080p") },
-  "视频放大 (Upsample)": { filter: m => m.includes("4k") || m.includes("1080p") },
+  "Veo 3.1 文生视频": { filter: m => /^veo-3\.1-(lite|fast|quality)(-\d+s-(landscape|portrait))?$/.test(m) },
+  "Omni 1.1 Flash（文生 / 参考图）": { filter: m => m.startsWith("omni-1.1-flash") },
+  "Veo 3.1 首帧 / 首尾帧 (I2V)": { filter: m => /^veo-3\.1-.*-i2v-/.test(m) },
+  "Veo 3.1 多图参考 (R2V)": { filter: m => /^veo-3\.1-.*-r2v-/.test(m) },
+  "Veo 3.1 视频续写 (Extend)": { filter: m => /^veo-3\.1-.*-extend-/.test(m) },
+  "旧名：文生视频 (T2V)": { filter: m => isLegacyVideo(m, "t2v") },
+  "旧名：图生视频 (I2V)": { filter: m => isLegacyVideo(m, "i2v") || isLegacyVideo(m, "interpolation") },
+  "旧名：多图视频 (R2V)": { filter: m => isLegacyVideo(m, "r2v") },
+  "旧名：视频放大 (Upsample)": { filter: isLegacyUpsample },
 };
+const OTHER_CATEGORY = "其他";
 
-const FALLBACK_MODELS = {
-  "gemini-3.1-flash-image": "Image generation (alias) - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
-  "gemini-3.0-pro-image": "Image generation (alias) - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
-  "imagen-4.0-generate-preview": "Image generation (alias) - aspects: landscape, portrait",
-  "veo_3_1_t2v_fast": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_fast_4s": "Video generation (alias) - 4s, supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_fast_landscape_4s": "Video generation - fast 4s landscape",
-  "veo_3_1_t2v_fast_6s": "Video generation (alias) - 6s, supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_fast_landscape_6s": "Video generation - fast 6s landscape",
-  "veo_3_1_t2v_fast_8s": "Video generation (alias) - 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_fast_landscape_8s": "Video generation - fast 8s landscape",
-  "veo_3_1_t2v_fast_ultra": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_fast_ultra_relaxed": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_4s": "Video generation (alias) - 4s, supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_landscape_4s": "Video generation - quality 4s landscape",
-  "veo_3_1_t2v_6s": "Video generation (alias) - 6s, supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_landscape_6s": "Video generation - quality 6s landscape",
-  "veo_3_1_t2v_8s": "Video generation (alias) - 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_t2v_landscape_8s": "Video generation - quality 8s landscape",
-  "veo_3_1_t2v_4k": "Video upsample alias - generate then upscale to 4K",
-  "veo_3_1_t2v_landscape_4k": "Video upsample alias - generate landscape then upscale to 4K",
-  "veo_3_1_t2v_1080p": "Video upsample alias - generate then upscale to 1080P",
-  "veo_3_1_t2v_landscape_1080p": "Video upsample alias - generate landscape then upscale to 1080P",
-  "veo_3_1_t2v_4s_4k": "Video upsample alias - generate 4s then upscale to 4K",
-  "veo_3_1_t2v_landscape_4s_4k": "Video upsample alias - generate 4s landscape then upscale to 4K",
-  "veo_3_1_t2v_4s_1080p": "Video upsample alias - generate 4s then upscale to 1080P",
-  "veo_3_1_t2v_landscape_4s_1080p": "Video upsample alias - generate 4s landscape then upscale to 1080P",
-  "veo_3_1_t2v_6s_4k": "Video upsample alias - generate 6s then upscale to 4K",
-  "veo_3_1_t2v_landscape_6s_4k": "Video upsample alias - generate 6s landscape then upscale to 4K",
-  "veo_3_1_t2v_6s_1080p": "Video upsample alias - generate 6s then upscale to 1080P",
-  "veo_3_1_t2v_landscape_6s_1080p": "Video upsample alias - generate 6s landscape then upscale to 1080P",
-  "veo_3_1_t2v_8s_4k": "Video upsample alias - generate 8s then upscale to 4K",
-  "veo_3_1_t2v_landscape_8s_4k": "Video upsample alias - generate 8s landscape then upscale to 4K",
-  "veo_3_1_t2v_8s_1080p": "Video upsample alias - generate 8s then upscale to 1080P",
-  "veo_3_1_t2v_landscape_8s_1080p": "Video upsample alias - generate 8s landscape then upscale to 1080P",
-  "veo_3_1_t2v_lite_8s": "Video generation (alias) - lite 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_fast_fl": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_fast_4s_fl": "Video generation (alias) - 4s, supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_fast_landscape_4s_fl": "Video generation - fast 4s landscape",
-  "veo_3_1_i2v_s_fast_6s_fl": "Video generation (alias) - 6s, supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_fast_landscape_6s_fl": "Video generation - fast 6s landscape",
-  "veo_3_1_i2v_s_fast_8s_fl": "Video generation (alias) - 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_fast_landscape_8s_fl": "Video generation - fast 8s landscape",
-  "veo_3_1_i2v_s_fast_ultra_fl": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_fast_ultra_relaxed": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_4s": "Video generation (alias) - 4s, supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_landscape_4s": "Video generation - quality 4s landscape",
-  "veo_3_1_i2v_s_6s": "Video generation (alias) - 6s, supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_landscape_6s": "Video generation - quality 6s landscape",
-  "veo_3_1_i2v_s_8s": "Video generation (alias) - 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_i2v_s_landscape_8s": "Video generation - quality 8s landscape",
-  "veo_3_1_i2v_s_4k": "Video upsample alias - generate then upscale to 4K",
-  "veo_3_1_i2v_s_landscape_4k": "Video upsample alias - generate landscape then upscale to 4K",
-  "veo_3_1_i2v_s_1080p": "Video upsample alias - generate then upscale to 1080P",
-  "veo_3_1_i2v_s_landscape_1080p": "Video upsample alias - generate landscape then upscale to 1080P",
-  "veo_3_1_i2v_s_4s_4k": "Video upsample alias - generate 4s then upscale to 4K",
-  "veo_3_1_i2v_s_landscape_4s_4k": "Video upsample alias - generate 4s landscape then upscale to 4K",
-  "veo_3_1_i2v_s_4s_1080p": "Video upsample alias - generate 4s then upscale to 1080P",
-  "veo_3_1_i2v_s_landscape_4s_1080p": "Video upsample alias - generate 4s landscape then upscale to 1080P",
-  "veo_3_1_i2v_s_6s_4k": "Video upsample alias - generate 6s then upscale to 4K",
-  "veo_3_1_i2v_s_landscape_6s_4k": "Video upsample alias - generate 6s landscape then upscale to 4K",
-  "veo_3_1_i2v_s_6s_1080p": "Video upsample alias - generate 6s then upscale to 1080P",
-  "veo_3_1_i2v_s_landscape_6s_1080p": "Video upsample alias - generate 6s landscape then upscale to 1080P",
-  "veo_3_1_i2v_s_8s_4k": "Video upsample alias - generate 8s then upscale to 4K",
-  "veo_3_1_i2v_s_landscape_8s_4k": "Video upsample alias - generate 8s landscape then upscale to 4K",
-  "veo_3_1_i2v_s_8s_1080p": "Video upsample alias - generate 8s then upscale to 1080P",
-  "veo_3_1_i2v_s_landscape_8s_1080p": "Video upsample alias - generate 8s landscape then upscale to 1080P",
-  "veo_3_1_i2v_lite_8s": "Video generation (alias) - lite 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_interpolation_lite_8s": "Video generation (alias) - interpolation lite 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_r2v_fast": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_r2v_fast_landscape": "Video generation - R2V fast landscape",
-  "veo_3_1_r2v_fast_8s": "Video generation (alias) - R2V fast 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_r2v_fast_landscape_8s": "Video generation - R2V fast 8s landscape",
-  "veo_3_1_r2v_fast_ultra": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_r2v_fast_landscape_ultra": "Video generation - R2V fast ultra landscape",
-  "veo_3_1_r2v_fast_ultra_8s": "Video generation (alias) - R2V fast ultra 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_r2v_fast_landscape_ultra_8s": "Video generation - R2V fast ultra 8s landscape",
-  "veo_3_1_r2v_fast_ultra_relaxed": "Video generation (alias) - supports landscape/portrait via generationConfig",
-  "veo_3_1_r2v_fast_landscape_ultra_relaxed": "Video generation - R2V fast ultra relaxed landscape",
-  "veo_3_1_r2v_fast_ultra_relaxed_8s": "Video generation (alias) - R2V fast ultra relaxed 8s, supports landscape/portrait via generationConfig",
-  "veo_3_1_r2v_fast_landscape_ultra_relaxed_8s": "Video generation - R2V fast ultra relaxed 8s landscape",
-  "veo_3_1_r2v_fast_landscape_ultra_4k": "Video upsample alias - generate R2V landscape then upscale to 4K",
-  "veo_3_1_r2v_fast_landscape_ultra_1080p": "Video upsample alias - generate R2V landscape then upscale to 1080P",
-};
+// 无 API Key 或加载失败时的内置候选（与当前公开模型名一致）
+const FALLBACK_MODELS = (() => {
+  const o = {};
+  const ori = ["landscape", "portrait"];
+  for (const a of ASPECTS) for (const z of ["", "-2k", "-4k"]) o[`gemini-3.1-flash-image-${a}${z}`] = "Flow Image";
+  for (const f of ["lite", "fast", "quality"]) {
+    o[`veo-3.1-${f}`] = `Veo 3.1 - ${f} · 8s · landscape`;
+    for (const t of [4, 6, 8]) for (const d of ori) o[`veo-3.1-${f}-${t}s-${d}`] = `Veo 3.1 - ${f} · ${t}s · ${d}`;
+    for (const t of [4, 6]) for (const d of ori) o[`veo-3.1-${f}-i2v-${t}s-${d}`] = `Veo 3.1 - ${f} I2V · ${t}s · ${d}`;
+    for (const d of ori) o[`veo-3.1-${f}-extend-8s-${d}`] = `Veo 3.1 - ${f} Extend · ${d}`;
+  }
+  for (const f of ["lite", "fast"]) for (const d of ori) o[`veo-3.1-${f}-r2v-8s-${d}`] = `Veo 3.1 - ${f} R2V · 8s · ${d}`;
+  o["omni-1.1-flash"] = "Omni 1.1 Flash · 8s · landscape";
+  for (const t of [4, 6, 8, 10]) for (const d of ori) o[`omni-1.1-flash-${t}s-${d}`] = `Omni 1.1 Flash · ${t}s · ${d}`;
+  return o;
+})();
 
 let ALL_MODELS = {};
 
@@ -316,16 +262,47 @@ function getModelType(modelId) {
 }
 
 function getModelMeta(modelId) {
-  // Determine supports_images, min/max from model name patterns
-  const isI2V = modelId.includes("i2v");
-  const isR2V = modelId.includes("r2v");
-  const isT2V = modelId.includes("t2v");
+  // 根据模型名判断是否支持上传图片及数量限制
   const isImage = getModelType(modelId) === "image";
-
   if (isImage) return { type: "image", supportsImages: true, minImages: 0, maxImages: 5 };
-  if (isI2V) return { type: "video", supportsImages: true, minImages: 1, maxImages: 2 };
-  if (isR2V) return { type: "video", supportsImages: true, minImages: 0, maxImages: 3 };
+  if (/(^|[-_])(i2v|interpolation)([-_]|$)/.test(modelId)) return { type: "video", supportsImages: true, minImages: 1, maxImages: 2 };
+  if (/(^|[-_])r2v([-_]|$)/.test(modelId)) return { type: "video", supportsImages: true, minImages: 1, maxImages: 3 };
+  if (modelId.startsWith("omni-1.1-flash")) return { type: "video", supportsImages: true, minImages: 0, maxImages: 3 };
   return { type: "video", supportsImages: false, minImages: 0, maxImages: 0 };
+}
+
+// 侧边栏显示名：把 landscape / four-three 等翻译成中文，完整模型名放在 title 悬浮提示和右侧面板标题里
+function modelLabel(modelId) {
+  const alias = modelId.match(/^(?:veo-3\.1-(lite|fast|quality)|omni-1\.1-(flash))$/);
+  if (alias) return `${alias[1] || alias[2]}（默认别名 · 8s 横屏）`;
+  const sizeM = modelId.match(/-(2k|4k)$/);
+  const base = sizeM ? modelId.slice(0, -3) : modelId;
+  const aspect = ASPECTS.find(k => base.endsWith("-" + k));
+  if (!aspect) return modelId;
+  const head = base.slice(0, -(aspect.length + 1));
+  const parts = [];
+  if (/^(gemini|imagen)/.test(modelId)) {
+    parts.push(ASPECT_LABEL[aspect]);
+  } else {
+    const rest = head.replace(/^(veo-3\.1|omni-1\.1)-/, "").replace(/-(i2v|r2v|extend)(?=-|$)/, "");
+    parts.push(...rest.split("-").filter(Boolean), ASPECT_LABEL[aspect]);
+  }
+  if (sizeM) parts.push(sizeM[1].toUpperCase());
+  return parts.join(" · ");
+}
+
+// 侧边栏排序：lite < fast < quality，时长从短到长，横屏在前；图片按画幅再按清晰度
+function modelSortKey(modelId) {
+  const fam = ["lite", "fast", "quality", "flash"].findIndex(f => modelId.includes("-" + f));
+  const secs = parseInt((modelId.match(/-(\d+)s-/) || [])[1] || "0", 10);
+  const aspect = ASPECTS.findIndex(k => modelId.includes("-" + k));
+  const size = modelId.endsWith("-4k") ? 2 : modelId.endsWith("-2k") ? 1 : 0;
+  return [fam, secs, aspect, size];
+}
+function compareModels(x, y) {
+  const kx = modelSortKey(x), ky = modelSortKey(y);
+  for (let i = 0; i < kx.length; i++) if (kx[i] !== ky[i]) return kx[i] - ky[i];
+  return x.localeCompare(y);
 }
 
 function renderSidebar() {
@@ -338,8 +315,16 @@ function renderSidebar() {
     return;
   }
 
-  for (const [catName, catDef] of Object.entries(MODEL_CATEGORIES)) {
-    const models = modelIds.filter(catDef.filter);
+  const claimed = new Set();
+  const categories = Object.entries(MODEL_CATEGORIES).map(([name, def]) => {
+    const list = modelIds.filter(m => !claimed.has(m) && def.filter(m)).sort(compareModels);
+    list.forEach(m => claimed.add(m));
+    return [name, list];
+  });
+  const others = modelIds.filter(m => !claimed.has(m)).sort(compareModels);
+  if (others.length) categories.push([OTHER_CATEGORY, others]);
+
+  for (const [catName, models] of categories) {
     if (models.length === 0) continue;
 
     const section = document.createElement("div");
@@ -358,7 +343,8 @@ function renderSidebar() {
       item.dataset.model = modelId;
 
       const type = getModelType(modelId);
-      const shortName = modelId.replace("gemini-3.1-flash-image-", "").replace("gemini-3.0-pro-image-", "").replace("imagen-4.0-generate-preview-", "");
+      item.title = modelId;
+      const shortName = modelLabel(modelId);
       item.innerHTML = `<span>${shortName}</span><span class="model-tag ${type === 'image' ? 'tag-image' : 'tag-video'}">${type === 'image' ? '图片' : '视频'}</span>`;
       item.onclick = () => selectModel(modelId);
       list.appendChild(item);
@@ -387,7 +373,9 @@ function selectModel(modelId) {
 
   // Update panel
   document.getElementById("selectedModelName").textContent = modelId;
-  document.getElementById("selectedModelInfo").textContent = ALL_MODELS[modelId] || "";
+  let info = ALL_MODELS[modelId] || "";
+  if (/-extend-/.test(modelId)) info += "（续写需要已有视频作为输入，此测试页暂不支持传入源视频）";
+  document.getElementById("selectedModelInfo").textContent = info;
 
   // Show/hide image upload
   const uploadGroup = document.getElementById("imageUploadGroup");
