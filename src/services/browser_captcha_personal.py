@@ -11533,11 +11533,13 @@ class BrowserCaptchaService:
         """
         normalized_action = str(action or "IMAGE_GENERATION").strip().upper()
         normalized_project_id = str(project_id or "").strip()
-        # Link 补丁（2026-10-12）：PERSONAL_IMAGE_VIA_OGIZ0B=1 时 IMAGE/VIDEO_GENERATION 也先
+        # Link 补丁（2026-10-12）：PERSONAL_IMAGE_VIA_OGIZ0B / PERSONAL_TRUSTED_BATCHEXECUTE 时非 CHAT action 也先
         # 重新打开项目页，让 bind 钩子捕获未被劫持的 execute（否则 trusted JS 取码超时）。
         nav_actions = {"CHAT_GENERATION"}
         if os.environ.get("PERSONAL_IMAGE_VIA_OGIZ0B", "").strip() == "1":
             nav_actions |= {"IMAGE_GENERATION", "VIDEO_GENERATION"}
+        if os.environ.get("PERSONAL_TRUSTED_BATCHEXECUTE", "").strip() == "1":
+            nav_actions |= {"IMAGE_GENERATION", "VIDEO_GENERATION", "UPLOAD_IMAGE"}
         if normalized_action not in nav_actions or not normalized_project_id:
             await self._wait_for_recaptcha(tab)
 

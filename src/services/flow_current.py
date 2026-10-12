@@ -607,6 +607,18 @@ class CurrentFlowClientMixin:
             return None
         method = self._resolve_third_party_captcha_method()
         if not method:
+            # Link 补丁（2026-10-12）：PERSONAL_TRUSTED_BATCHEXECUTE=1 时，personal 模式未配置
+            # 第三方打码也不再报错，改用浏览器 trusted token（页面加载前捕获的未劫持
+            # enterprise.execute，action 保持真实值）。实测 YhhmEf / MZZa6b 可端到端出片；
+            # 上游"浏览器 token 不可用"的结论源于被劫持成 extension_hijack_detected 的 token。
+            if (
+                config.captcha_method == "personal"
+                and os.environ.get("PERSONAL_TRUSTED_BATCHEXECUTE", "").strip() == "1"
+            ):
+                debug_logger.log_info(
+                    "[batchexecute] 未配置第三方打码，personal 使用浏览器 trusted token"
+                )
+                return None
             raise RuntimeError(
                 "当前浏览器打码模式不支持该 Flow RPC；请先配置 YesCaptcha、"
                 "Captcha.run、CapMonster、EzCaptcha 或 CapSolver API Key"
