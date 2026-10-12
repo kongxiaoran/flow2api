@@ -688,6 +688,7 @@ class CurrentFlowClientMixin:
         end_media_id: Optional[str] = None,
         video_media_id: Optional[str] = None,
         resolution: Optional[str] = None,
+        workflow_id: Optional[str] = None,
     ) -> dict:
         await self._frontend_cookie(google_cookies, token_id)
         captcha_override = self._resolve_batchexecute_captcha_override()
@@ -720,6 +721,7 @@ class CurrentFlowClientMixin:
                     end_media_id=end_media_id,
                     video_media_id=video_media_id,
                     resolution=resolution,
+                    workflow_id=workflow_id,
                 )
                 payload = await self._current_rpc(
                     rpc_id=rpc_id,
@@ -921,12 +923,39 @@ class CurrentFlowClientMixin:
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
     ) -> dict:
+        workflow_id = None
+        if os.environ.get("FLOW_VIDEO_UPSAMPLE_WEB_LAYOUT", "").strip() == "1":
+            # Link 补丁（2026-10-12）：网页放大请求需要源视频的 workflowId，
+            # 用 jwpduf 查询（响应记录为 [mediaId, projectId, workflowId, ...]）。
+            try:
+                status_payload = await self._current_rpc(
+                    rpc_id="jwpduf",
+                    argument=[None, None, [[str(video_media_id or "").strip()]]],
+                    google_cookies=google_cookies,
+                    token_id=token_id,
+                    project_id=project_id,
+                    timeout=60,
+                )
+                for record in self._extract_frontend_video_records(
+                    status_payload, project_id=project_id
+                ):
+                    if str(record[0] or "").strip() == str(video_media_id or "").strip():
+                        workflow_id = str(record[2] or "").strip() or None
+                        break
+            except Exception as lookup_error:
+                debug_logger.log_warning(
+                    f"[UPSAMPLE] 查询源视频 workflowId 失败: {lookup_error}"
+                )
+            debug_logger.log_info(
+                f"[UPSAMPLE] 源视频 {video_media_id} workflowId={workflow_id or '<none>'}"
+            )
         return await self._current_generate_video(
             project_id=project_id,
             prompt="",
             model_key=model_key,
             aspect_ratio=aspect_ratio,
             mode="upsample",
+            workflow_id=workflow_id,
             video_media_id=video_media_id,
             resolution=resolution,
             token_id=token_id,

@@ -1,5 +1,6 @@
 """Current flow.google.com frontend RPC transport and response adapters."""
 
+import os
 import json
 import random
 import re
@@ -327,6 +328,7 @@ class FlowFrontendMixin:
         video_media_id: Optional[str] = None,
         resolution: Optional[str] = None,
         output_spec: Optional[Any] = None,
+        workflow_id: Optional[str] = None,
     ) -> tuple[str, List[Any]]:
         prompt_value = self._frontend_prompt(prompt)
         prompt_message = [None, None, prompt_value]
@@ -394,6 +396,32 @@ class FlowFrontendMixin:
                 metadata,
                 None,
                 output_spec,
+            ]
+        elif normalized_mode == "upsample" and os.environ.get(
+            "FLOW_VIDEO_UPSAMPLE_WEB_LAYOUT", ""
+        ).strip() == "1":
+            # Link 补丁（2026-10-12）：按网页真实请求（抓包 20261010-003019 / 5087a5e5）构造
+            # p0UkFb。上游结构会被 Flow 以 code=[3] INVALID_ARGUMENT 拒绝。
+            # request 32 项：[0]=[null,src]、[2]=画幅、[4]=[null,workflowId,null,null,uuid]、
+            # [6]=分辨率枚举（1080p=2，已实测；4K=3 为推测）、[31]=upsampler 模型键；
+            # 外层第 3 项只有 [uuid]（生成类 RPC 才是 [uuid, 2]）。
+            rpc_id = "p0UkFb"
+            request = [None] * 32
+            request[0] = [None, str(video_media_id or "").strip()]
+            request[2] = aspect_value
+            request[4] = [
+                None,
+                str(workflow_id or "").strip() or None,
+                None,
+                None,
+                str(uuid.uuid4()).upper(),
+            ]
+            request[6] = 3 if "4K" in str(resolution or "").upper() else 2
+            request[31] = model_key or None
+            return rpc_id, [
+                [request],
+                self._frontend_project_context(project_id, recaptcha_token),
+                [str(uuid.uuid4()).upper()],
             ]
         elif normalized_mode == "upsample":
             rpc_id = "p0UkFb"

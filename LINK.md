@@ -10,6 +10,7 @@
 | `PERSONAL_DISABLE_COOKIE_MIRROR=1` | 不再把 Google 会话 Cookie 镜像到 `www.google.com` / `www.recaptcha.net`，并剔除历史回填的镜像副本。镜像副本会让 reCAPTCHA 给出 ~600 的低分 token，Flow 返回 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` |
 | `PERSONAL_IMAGE_VIA_OGIZ0B=1` | personal 生图不走 StreamChat（当前返回空结果），改为 trusted token(`IMAGE_GENERATION`) + `ogiZ0b`；`NARWHAL` 映射为 `PERSONAL_NARWHAL_MODEL_KEY`（默认 `BELUGA`） |
 | `PERSONAL_TRUSTED_BATCHEXECUTE=1` | 视频（`YhhmEf`/`MZZa6b` 等）、放大（`SPrCad`）、上传（`maseQ`）在未配置第三方打码时改用浏览器 trusted token，不再报“请先配置 YesCaptcha…” |
+| `FLOW_VIDEO_UPSAMPLE_WEB_LAYOUT=1` | 视频放大 `p0UkFb` 按网页真实请求构造（先用 `jwpduf` 查源视频 workflowId，`[4]=[null,workflowId,null,null,uuid]`、`[2]`=画幅、`[6]`=分辨率枚举 1080p=2、外层第 3 项 `[uuid]`）。上游结构会被 Flow 以 `code=[3]` 拒绝 |
 | `PERSONAL_FORCE_UA` / `_MACOS` / `_EN_US` / `_SCREEN` / `_CORES` / `_MEMORY` / `_APPLE_GPU` | 固定伪装画像，避免随机组合自相矛盾 |
 | `PERSONAL_DISABLE_SURFACE_SPOOF` / `PERSONAL_BROWSER_CDP_HOST` / `PERSONAL_BROWSER_CDP_PORT` | 连接外部浏览器（诊断用） |
 
