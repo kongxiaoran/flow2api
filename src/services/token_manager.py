@@ -28,6 +28,8 @@ class TokenManager:
         self._at_validation_cache: dict[int, float] = {}
         self._last_at_refresh_error: dict[int, str] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
+        # Link 补丁（2026-10-12）：Cookie 保活，记录各 Token 上次轮换的时间（单调时钟）
+        self._cookie_keepalive_last: dict[int, float] = {}
 
     async def _get_token_lock(
         self,
@@ -1125,9 +1127,82 @@ class TokenManager:
                     f"[PROTOCOL_REFRESH] Token {getattr(token, 'id', '?')}: 后台刷新异常 - {e}"
                 )
 
+    async def run_cookie_keepalive_once(self) -> None:
+        """Link 补丁：定期轮换 Google 会话 Cookie（FLOW_COOKIE_KEEPALIVE_MINUTES，0=关闭）。
+
+        上游只会在“生成请求新建浏览器标签页”时回填一次 Cookie，空闲 10 分钟后标签页被回收；
+        协议 ST 刷新只验证页面能否打开、丢弃 Set-Cookie。没人用的时候服务器上的
+        __Secure-*PSIDTS 副本不再更新，过期后 AT 刷新 401、Token 被自动禁用。
+        这里模拟浏览器的 RotateCookies，把新值合并写回 tokens.google_cookies。
+        """
+        from .cookie_keepalive import keepalive_interval_minutes, log_result, rotate_google_cookies
+
+        minutes = keepalive_interval_minutes()
+        if minutes <= 0:
+            return
+        tokens = await self.db.get_active_tokens()
+        now_mono = time.monotonic()
+        for token in tokens:
+            token_id = int(token.id)
+            try:
+                if not (token.google_cookies or "").strip():
+                    continue
+                last = self._cookie_keepalive_last.get(token_id)
+                if last is not None and now_mono - last < minutes * 60:
+                    continue
+                # 先记时间：失败也按间隔重试，避免对 Google 连续请求
+                self._cookie_keepalive_last[token_id] = now_mono
+
+                refresh_lock = await self._get_token_lock(
+                    self._refresh_locks, self._refresh_lock_guard, token_id
+                )
+                async with refresh_lock:
+                    latest = await self.db.get_token(token_id)
+                    if not latest or not latest.is_active:
+                        continue
+                    proxy_url = (getattr(latest, "proxy_url", "") or "").strip()
+                    if not proxy_url:
+                        proxy_manager = getattr(self.flow_client, "proxy_manager", None)
+                        if proxy_manager is not None:
+                            try:
+                                proxy_url = (
+                                    await proxy_manager.get_request_proxy_url() or ""
+                                ).strip()
+                            except Exception as e:
+                                debug_logger.log_warning(
+                                    f"[COOKIE_KEEPALIVE] Token {token_id}: 获取请求代理失败 - {e}"
+                                )
+                    result = await rotate_google_cookies(
+                        latest.google_cookies, proxy=proxy_url or None
+                    )
+                    if result.get("ok"):
+                        await self.db.update_token(token_id, google_cookies=result["raw"])
+                    log_result(token_id, result)
+                    # docker logs 里可见（不依赖 debug 开关），每个 Token 每个间隔最多一行
+                    if result.get("ok"):
+                        print(
+                            f"[COOKIE_KEEPALIVE] Token {token_id}: rotated "
+                            f"{len(result['rotated'])} cookies"
+                        )
+                    else:
+                        print(
+                            f"[COOKIE_KEEPALIVE] Token {token_id}: FAILED - {result.get('error')}"
+                        )
+            except Exception as e:
+                debug_logger.log_error(
+                    f"[COOKIE_KEEPALIVE] Token {token_id}: 保活异常 - {e}"
+                )
+                print(f"[COOKIE_KEEPALIVE] Token {token_id}: ERROR - {e}")
+
     async def _protocol_refresh_loop(self) -> None:
         while True:
             await asyncio.sleep(60)
+            try:
+                await self.run_cookie_keepalive_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                debug_logger.log_error(f"[COOKIE_KEEPALIVE] 后台任务异常 - {e}")
             try:
                 await self.run_protocol_refresh_once()
             except asyncio.CancelledError:

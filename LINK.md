@@ -11,6 +11,7 @@
 | `PERSONAL_IMAGE_VIA_OGIZ0B=1` | personal 生图不走 StreamChat（当前返回空结果），改为 trusted token(`IMAGE_GENERATION`) + `ogiZ0b`；`NARWHAL` 映射为 `PERSONAL_NARWHAL_MODEL_KEY`（默认 `BELUGA`） |
 | `PERSONAL_TRUSTED_BATCHEXECUTE=1` | 视频（`YhhmEf`/`MZZa6b` 等）、放大（`SPrCad`）、上传（`maseQ`）在未配置第三方打码时改用浏览器 trusted token，不再报“请先配置 YesCaptcha…” |
 | `FLOW_VIDEO_UPSAMPLE_WEB_LAYOUT=1` | 视频放大 `p0UkFb` 按网页真实请求构造（先用 `jwpduf` 查源视频 workflowId，`[4]=[null,workflowId,null,null,uuid]`、`[2]`=画幅、`[6]`=分辨率枚举 1080p=2、外层第 3 项 `[uuid]`）。上游结构会被 Flow 以 `code=[3]` 拒绝。提交后以 `<源id>_upsampled` 建任务，轮询允许该后缀 id，完成后用它调 `as29s` 取 `/video/` 直链（`jwpduf` 状态 `[1]` 处理中、`[3]` 完成，本身不带直链） |
+| `FLOW_COOKIE_KEEPALIVE_MINUTES=10` | Cookie 保活：后台每 N 分钟（2～240，0=关闭）对每个启用且有 Cookie 的 Token 模拟浏览器的 `POST accounts.google.com/RotateCookies`，把新的 `__Secure-*PSIDTS` / `*PSIDCC` / `SIDCC` 合并写回 `tokens.google_cookies`（走与请求相同的代理）。上游只在“新建浏览器标签页”时回填一次、空闲 10 分钟回收标签页，协议 ST 刷新又丢弃 `Set-Cookie`，没人用时副本会过期，AT 刷新 401 后 Token 被自动禁用。`docker logs` 里每个间隔一行 `[COOKIE_KEEPALIVE]`，不含 Cookie 值 |
 | `PERSONAL_FORCE_UA` / `_MACOS` / `_EN_US` / `_SCREEN` / `_CORES` / `_MEMORY` / `_APPLE_GPU` | 固定伪装画像，避免随机组合自相矛盾 |
 | `PERSONAL_DISABLE_SURFACE_SPOOF` / `PERSONAL_BROWSER_CDP_HOST` / `PERSONAL_BROWSER_CDP_PORT` | 连接外部浏览器（诊断用） |
 
