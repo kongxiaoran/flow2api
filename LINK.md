@@ -26,3 +26,18 @@ git rebase origin/main   # 冲突只会出现在 browser_captcha_personal.py / f
 ```
 
 所有补丁块都带 `Link 补丁` / `Link patch` 注释，便于检索。
+
+## 接口行为变更（无环境变量开关，直接生效）
+
+### 模型列表只列基础模型
+- `GET /v1/models`、`GET /v1beta/models` 默认只返回基础模型：图片 `gemini-3.1-flash-image`，视频 `veo-3.1-lite` / `veo-3.1-fast` / `veo-3.1-quality` / `omni-1.1-flash`。每项带 `type` 和 `parameters`（可传的参数及取值）。
+- `?full=1`（或 `?detail=all`）返回全部具体模型名（如 `gemini-3.1-flash-image-portrait-4k`、`veo-3.1-fast-6s-portrait`）。具体名仍然可以直接调用，向后兼容；`GET /v1/models/{id}` 对基础名和具体名都能查。
+- 图片参数：`generationConfig.imageConfig.aspectRatio`（16:9 / 9:16 / 1:1 / 4:3 / 3:4）、`imageSize`（2k / 4k，默认 1k）；OpenAI 风格 `size`（如 `1024x1792`）、`quality`（medium→2k，high/hd→4k）也支持。
+- 视频参数：`generationConfig.videoConfig.{aspectRatio, durationSeconds, imageMode}`（也认顶层 `seconds` / `duration` / `aspect_ratio` / `size`）。不带参数且不带图片时等价于原来的 8 秒横屏别名。带 1-2 张图 → 首帧/首尾帧（i2v，4|6 秒）；3 张图或 `imageMode=reference` → 多图参考（r2v，固定 8 秒，只有 lite/fast，quality 自动用 fast）；Omni 带 0-3 张图都用同一个名字。不支持的时长取最接近的档位。视频续写（extend）需要源视频，只在具体名里。
+
+### OpenAI Images 协议
+- `POST /v1/images/generations`（JSON）、`POST /v1/images/edits`（multipart，也接受 JSON 的 `image` / `images`），并挂载不带 `/v1` 的 `/images/generations`、`/images/edits`。
+- 请求：`model`（默认 `gemini-3.1-flash-image`）、`prompt`、`n`（1-4，顺序生成）、`size`、`quality`、`response_format`；未指定尺寸的文生图默认 `1024x1024`（方图），图生图按输入图比例推断。`mask` 会被忽略（Flow 不支持蒙版），`stream` 返回 400。
+- 响应：`{"created": ..., "data": [{"url", "b64_json"}]}`，不带 `response_format` 时同时给 `url`（Flow 签名链接，会过期）和 `b64_json`；指定时只给对应字段。响应头 `X-Flow2API-Model` 是实际解析出的具体模型名。n>1 中途失败时保留已成功的图片，全部失败才返回错误。错误体为 OpenAI 格式 `{"error": {"message", "type", "param", "code"}}`。
+- Sub2API 对 `gemini-*-image` 模型名走“Gemini 兼容生图”路径，转发到 `/v1/images/generations`；上游只返回 `url` 时它会自己补 `b64_json`。
+

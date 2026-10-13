@@ -6,6 +6,7 @@ import base64
 import json
 import mimetypes
 import re
+import time
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -22,7 +23,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.logger import debug_logger
-from ..core.model_resolver import get_base_model_aliases, resolve_model_name
+from ..core.model_resolver import (
+    get_base_model_aliases,
+    get_public_model_catalog,
+    resolve_model_name,
+)
 from ..core.models import (
     ChatCompletionRequest,
     ChatMessage,
@@ -119,11 +124,25 @@ def _build_model_description(model_config: Dict[str, Any]) -> str:
     return description
 
 
-def _get_openai_model_catalog() -> List[Dict[str, str]]:
-    """Collect OpenAI-compatible model list entries."""
+MODEL_LIST_CREATED = int(time.time())
+
+
+def _is_truthy_flag(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "all", "full"}
+
+
+def _get_openai_model_catalog(full: bool = False) -> List[Dict[str, Any]]:
+    """Collect OpenAI-compatible model list entries.
+
+    Link 补丁（2026-10-13）：默认只返回基础模型（尺寸 / 画幅 / 时长是请求参数）；
+    full=True 返回全部具体模型名（如 gemini-3.1-flash-image-portrait-4k）。
+    """
+    if not full:
+        return get_public_model_catalog(MODEL_CONFIG)
     return [
         {
             "id": model_id,
+            "type": model_config.get("type"),
             "description": _build_model_description(model_config),
         }
         for model_id, model_config in MODEL_CONFIG.items()
@@ -131,9 +150,14 @@ def _get_openai_model_catalog() -> List[Dict[str, str]]:
     ]
 
 
-def _get_gemini_model_catalog() -> Dict[str, str]:
+def _get_gemini_model_catalog(full: bool = False) -> Dict[str, str]:
     """Collect Gemini-compatible model metadata for /models endpoints."""
     catalog: Dict[str, str] = {}
+
+    if not full:
+        for entry in get_public_model_catalog(MODEL_CONFIG):
+            catalog.setdefault(entry["id"], entry["description"])
+        return catalog
 
     for model_id, model_config in MODEL_CONFIG.items():
         if not model_config.get("listed", True):
@@ -141,6 +165,21 @@ def _get_gemini_model_catalog() -> Dict[str, str]:
         catalog.setdefault(model_id, _build_model_description(model_config))
 
     return catalog
+
+
+def _build_openai_model_object(entry: Dict[str, Any]) -> Dict[str, Any]:
+    model_object: Dict[str, Any] = {
+        "id": entry["id"],
+        "object": "model",
+        "created": MODEL_LIST_CREATED,
+        "owned_by": "flow2api",
+        "description": entry["description"],
+    }
+    if entry.get("type"):
+        model_object["type"] = entry["type"]
+    if entry.get("parameters"):
+        model_object["parameters"] = entry["parameters"]
+    return model_object
 
 
 def _build_gemini_model_resource(model_id: str, description: str) -> Dict[str, Any]:
@@ -820,16 +859,19 @@ async def _iterate_gemini_stream(
 
 
 @router.get("/v1/models")
-async def list_models(api_key: str = Depends(verify_api_key_flexible)):
-    """List available models."""
+async def list_models(
+    full: Optional[str] = Query(None),
+    detail: Optional[str] = Query(None),
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """List available models.
+
+    默认只列基础模型；`?full=1`（或 `?detail=all`）列出全部具体模型名。
+    """
+    show_full = _is_truthy_flag(full) or _is_truthy_flag(detail)
     models = [
-        {
-            "id": model["id"],
-            "object": "model",
-            "owned_by": "flow2api",
-            "description": model["description"],
-        }
-        for model in _get_openai_model_catalog()
+        _build_openai_model_object(model)
+        for model in _get_openai_model_catalog(full=show_full)
     ]
 
     return {"object": "list", "data": models}
@@ -851,11 +893,30 @@ async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
     return {"object": "list", "data": alias_models}
 
 
+@router.get("/v1/models/{model_id}")
+async def retrieve_model(model_id: str, api_key: str = Depends(verify_api_key_flexible)):
+    """Retrieve one model (base model or any concrete model name)."""
+    entries = {entry["id"]: entry for entry in _get_openai_model_catalog(full=True)}
+    entries.update({entry["id"]: entry for entry in _get_openai_model_catalog()})
+    entry = entries.get(model_id)
+    if not entry:
+        return _openai_error(
+            404,
+            f"The model `{model_id}` does not exist",
+            param="model",
+            code="model_not_found",
+        )
+    return _build_openai_model_object(entry)
+
+
 @router.get("/v1beta/models")
 @router.get("/models")
-async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
-    """List available models using Gemini-compatible response shape."""
-    catalog = _get_gemini_model_catalog()
+async def list_gemini_models(
+    full: Optional[str] = Query(None),
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """List available models using Gemini-compatible response shape（默认只列基础模型，?full=1 列全部）。"""
+    catalog = _get_gemini_model_catalog(full=_is_truthy_flag(full))
     return {
         "models": [
             _build_gemini_model_resource(model_id, description)
@@ -868,7 +929,7 @@ async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
 @router.get("/models/{model}")
 async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_flexible)):
     """Return a single model using Gemini-compatible response shape."""
-    catalog = _get_gemini_model_catalog()
+    catalog = _get_gemini_model_catalog(full=True)
     description = catalog.get(model)
     if not description:
         return JSONResponse(
@@ -919,6 +980,256 @@ async def create_chat_completion(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ──────────────────────────────────────────────────────────────
+# Link 补丁（2026-10-13）：OpenAI Images 协议
+#   POST /v1/images/generations   文生图（JSON）
+#   POST /v1/images/edits         图生图 / 编辑（multipart，或 JSON 的 image / images）
+# 同时挂载不带 /v1 的路径（部分网关的 base_url 不含 /v1）。
+# 尺寸、画幅是请求参数：size（如 1024x1792）、quality（high/hd→4k、medium→2k）、
+# aspect_ratio / image_size，或 Gemini 风格的 generationConfig.imageConfig。
+# ──────────────────────────────────────────────────────────────
+OPENAI_IMAGES_DEFAULT_MODEL = "gemini-3.1-flash-image"
+OPENAI_IMAGES_MAX_N = 4
+_IMAGE_BODY_RESERVED_KEYS = {
+    "model", "prompt", "n", "response_format", "image", "images", "mask", "stream", "user",
+}
+_EXPLICIT_ASPECT_KEYS = ("aspect_ratio", "aspectRatio", "generationConfig", "extra_body", "extraBody")
+
+
+class _ImageParamBag:
+    """让 resolve_model_name 用读取 pydantic 请求的方式读取图片接口的参数。"""
+
+    def __init__(self, body: Dict[str, Any]):
+        self.generationConfig = body.get("generationConfig")
+        self.__pydantic_extra__ = {
+            key: value for key, value in body.items() if key not in _IMAGE_BODY_RESERVED_KEYS
+        }
+
+
+def _openai_error(
+    status_code: int,
+    message: str,
+    *,
+    param: Optional[str] = None,
+    code: Optional[str] = None,
+    error_type: Optional[str] = None,
+) -> JSONResponse:
+    """OpenAI 风格错误体：{"error": {"message", "type", "param", "code"}}。"""
+    if error_type is None:
+        if status_code == 429:
+            error_type = "rate_limit_error"
+        elif status_code in (401, 403):
+            error_type = "authentication_error"
+        else:
+            error_type = "invalid_request_error" if status_code < 500 else "server_error"
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {"message": message, "type": error_type, "param": param, "code": code}
+        },
+    )
+
+
+def _openai_error_from_handler(payload: Dict[str, Any]) -> JSONResponse:
+    error = payload.get("error", {})
+    message = error.get("message") if isinstance(error, dict) else str(error)
+    return _openai_error(_get_error_status_code(payload), message or "Image generation failed")
+
+
+async def _create_openai_images(
+    *,
+    raw_request: Request,
+    model: Optional[str],
+    prompt: Optional[str],
+    n: Any,
+    response_format: Optional[str],
+    stream: bool,
+    body: Dict[str, Any],
+    images: List[bytes],
+) -> JSONResponse:
+    model = (model or "").strip() or OPENAI_IMAGES_DEFAULT_MODEL
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return _openai_error(400, "`prompt` is required", param="prompt", code="missing_required_parameter")
+    try:
+        count = int(n) if n not in (None, "") else 1
+    except (TypeError, ValueError):
+        return _openai_error(400, "`n` must be an integer", param="n")
+    if count < 1 or count > OPENAI_IMAGES_MAX_N:
+        return _openai_error(
+            400, f"`n` must be between 1 and {OPENAI_IMAGES_MAX_N}", param="n", code="invalid_value"
+        )
+    fmt = (response_format or "").strip().lower() or None
+    if fmt not in (None, "url", "b64_json"):
+        return _openai_error(
+            400, "`response_format` must be `url` or `b64_json`", param="response_format", code="invalid_value"
+        )
+    if stream:
+        return _openai_error(400, "`stream` is not supported by this endpoint", param="stream")
+
+    bag = _ImageParamBag(body)
+    size_value = str(body.get("size") or "").strip().lower()
+    if not images and size_value in ("", "auto") and not any(key in body for key in _EXPLICIT_ASPECT_KEYS):
+        # OpenAI 文生图未指定尺寸时默认 1024x1024（方图）；图生图不注入，按输入图比例推断
+        bag.__pydantic_extra__["size"] = "1024x1024"
+
+    try:
+        resolved_model = _resolve_request_model(model, bag, images=images)
+        model_config = MODEL_CONFIG.get(resolved_model)
+        if not model_config:
+            return _openai_error(
+                404, f"The model `{model}` does not exist", param="model", code="model_not_found"
+            )
+        if model_config.get("type") != "image":
+            return _openai_error(
+                400, f"The model `{model}` is not an image model", param="model", code="invalid_model"
+            )
+
+        request_base_url = _get_request_base_url(raw_request)
+        clean_prompt = _sanitize_media_prompt(prompt) or prompt
+        data: List[Dict[str, Any]] = []
+        failure: Optional[JSONResponse] = None
+        for _ in range(count):
+            payload = _enrich_payload_with_direct_url(
+                _parse_handler_result(
+                    await _collect_non_stream_result(
+                        resolved_model,
+                        clean_prompt,
+                        images,
+                        base_url_override=request_base_url,
+                    )
+                )
+            )
+            if "error" in payload:
+                failure = _openai_error_from_handler(payload)
+                break
+            url = payload.get("url")
+            if not url:
+                failure = _openai_error(502, "Generation finished without an image", code="no_image")
+                break
+            item: Dict[str, Any] = {}
+            if fmt in (None, "url"):
+                item["url"] = url
+            if fmt in (None, "b64_json"):
+                image_bytes = await retrieve_image_data(url)
+                if image_bytes:
+                    item["b64_json"] = base64.b64encode(image_bytes).decode("ascii")
+                elif fmt == "b64_json":
+                    failure = _openai_error(502, "Failed to download the generated image", code="download_failed")
+                    break
+            data.append(item)
+
+        # n>1 时若中途失败，保留已生成成功的图片（已消耗额度），全部失败才返回错误
+        if not data:
+            return failure or _openai_error(502, "Image generation failed")
+
+        return JSONResponse(
+            content={"created": int(time.time()), "data": data},
+            headers={"X-Flow2API-Model": resolved_model},
+        )
+    except HTTPException as exc:
+        return _openai_error(exc.status_code, str(exc.detail))
+    except Exception as exc:
+        debug_logger.log_error(f"[OPENAI_IMAGES] 生成失败: {exc}")
+        return _openai_error(500, str(exc))
+
+
+@router.post("/v1/images/generations")
+@router.post("/images/generations")
+async def openai_images_generations(
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """OpenAI Images API: create image."""
+    try:
+        body = await raw_request.json()
+    except Exception:
+        return _openai_error(400, "Request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _openai_error(400, "Request body must be a JSON object")
+    return await _create_openai_images(
+        raw_request=raw_request,
+        model=body.get("model"),
+        prompt=body.get("prompt"),
+        n=body.get("n"),
+        response_format=body.get("response_format"),
+        stream=bool(body.get("stream")),
+        body=body,
+        images=[],
+    )
+
+
+async def _images_from_json_value(value: Any) -> List[bytes]:
+    """JSON 形式的 image / images：字符串（URL 或 data URL）、{"image_url": ...}、或它们的列表。"""
+    if value in (None, "", []):
+        return []
+    items = value if isinstance(value, list) else [value]
+    loaded: List[bytes] = []
+    for item in items:
+        uri: Optional[str] = None
+        if isinstance(item, str):
+            uri = item.strip()
+        elif isinstance(item, dict):
+            image_url = item.get("image_url") or item.get("url")
+            uri = (image_url.get("url") if isinstance(image_url, dict) else image_url) or None
+        if uri:
+            loaded.append(await _load_image_bytes_from_uri(uri))
+    return loaded
+
+
+@router.post("/v1/images/edits")
+@router.post("/images/edits")
+async def openai_images_edits(
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """OpenAI Images API: edit image（multipart/form-data；也接受 JSON 的 image / images）。"""
+    content_type = (raw_request.headers.get("content-type") or "").lower()
+    body: Dict[str, Any] = {}
+    images: List[bytes] = []
+    try:
+        if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+            form = await raw_request.form()
+            for key, value in form.multi_items():
+                if hasattr(value, "read"):  # 上传文件
+                    if key in ("image", "image[]", "images", "images[]"):
+                        file_bytes = await value.read()
+                        if file_bytes:
+                            images.append(file_bytes)
+                    elif key in ("mask", "mask[]"):
+                        debug_logger.log_warning("[OPENAI_IMAGES] 忽略 mask：Flow 不支持蒙版编辑")
+                    continue
+                if key in ("image", "image[]", "images", "images[]"):
+                    images.extend(await _images_from_json_value(value))
+                else:
+                    body[key] = value
+        else:
+            parsed = await raw_request.json()
+            if not isinstance(parsed, dict):
+                return _openai_error(400, "Request body must be a JSON object")
+            body = parsed
+            images = await _images_from_json_value(body.get("images")) or await _images_from_json_value(
+                body.get("image")
+            )
+    except HTTPException as exc:
+        return _openai_error(exc.status_code, str(exc.detail), param="image")
+    except Exception:
+        return _openai_error(400, "Failed to parse the request body")
+
+    if not images:
+        return _openai_error(400, "`image` is required", param="image", code="missing_required_parameter")
+    return await _create_openai_images(
+        raw_request=raw_request,
+        model=body.get("model"),
+        prompt=body.get("prompt"),
+        n=body.get("n"),
+        response_format=body.get("response_format"),
+        stream=str(body.get("stream") or "").strip().lower() in {"1", "true", "yes"},
+        body=body,
+        images=images,
+    )
 
 
 @router.post("/v1beta/models/{model}:generateContent")

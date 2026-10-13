@@ -64,6 +64,16 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
   font-family: inherit;
 }
 .form-group textarea:focus { outline: none; border-color: #7c8aff; }
+.param-row { display: flex; flex-wrap: wrap; gap: 12px; }
+.form-group .param-item { display: flex; flex-direction: column; gap: 4px; min-width: 130px; flex: 1; margin-bottom: 0; }
+.param-item span { font-size: 12px; color: #888; }
+.param-item select {  width: 100%;
+  background: #0f1015; color: #e0e0e0; border: 1px solid #2a2b3a; border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
+.param-item select:focus { outline: none; border-color: #7c8aff; }
+.full-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #888; margin: 0 0 12px; cursor: pointer; }
+.param-hint { font-size: 12px; color: #666; margin-top: 6px; }
 
 .image-upload-area {
   border: 2px dashed #2a2b3a; border-radius: 8px; padding: 20px; text-align: center;
@@ -133,6 +143,7 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
     <input type="text" id="baseUrl" placeholder="http://localhost:8000" />
   </div>
   <p class="config-note">未填写 API Key 或模型列表加载失败时，会回退到内置候选模型；实际生成前仍需填写有效 API Key。</p>
+  <label class="full-toggle"><input type="checkbox" id="showFull"> 显示全部具体模型名（如 gemini-3.1-flash-image-portrait-4k，兼容旧用法；默认只列基础模型，尺寸 / 画幅 / 时长作为参数选择）</label>
 
   <div class="main-layout">
     <div class="sidebar" id="modelSidebar"></div>
@@ -144,6 +155,12 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
         <div class="form-group">
           <label>提示词 (Prompt)</label>
           <textarea id="promptInput" placeholder="描述你想生成的内容...">一只可爱的橘猫趴在窗台上晒太阳，窗外是樱花盛开的春天</textarea>
+        </div>
+
+        <div class="form-group" id="paramGroup" style="display:none;">
+          <label>生成参数</label>
+          <div class="param-row" id="paramFields"></div>
+          <div class="param-hint" id="paramHint"></div>
         </div>
 
         <div class="form-group" id="imageUploadGroup" style="display:none;">
@@ -168,7 +185,7 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
 </div>
 
 <script>
-const STATE = { selectedModel: null, modelConfig: null, images: [], generating: false };
+const STATE = { selectedModel: null, baseEntry: null, modelConfig: null, images: [], generating: false };
 </script>
 <script>
 // Model categories for sidebar
@@ -215,12 +232,39 @@ const FALLBACK_MODELS = (() => {
   return o;
 })();
 
-let ALL_MODELS = {};
+let ALL_MODELS = {};   // 具体模型名 → 描述（显示全部具体模型名时使用）
+let BASE_MODELS = {}; // 基础模型 id → {id, type, description, parameters}
+
+// 无 API Key 或加载失败时的内置基础模型（与服务端 /v1/models 默认返回一致）
+const FALLBACK_BASE = [
+  { id: "gemini-3.1-flash-image", type: "image", description: "Flow image generation. 0-5 images for image-to-image.",
+    parameters: { aspectRatio: ["16:9", "9:16", "1:1", "4:3", "3:4"], imageSize: ["1k", "2k", "4k"], images: { min: 0, max: 5 } } },
+  ...["lite", "fast", "quality"].map(f => ({
+    id: `veo-3.1-${f}`, type: "video",
+    description: `Veo 3.1 ${f} video. With 1-2 images: first/last-frame video; 3 images or imageMode=reference: reference video.`,
+    parameters: { aspectRatio: ["16:9", "9:16"], durationSeconds: [4, 6, 8], images: { min: 0, max: 3 }, imageMode: ["frames", "reference"] },
+  })),
+  { id: "omni-1.1-flash", type: "video", description: "Omni 1.1 Flash video. Text-to-video, or reference-image video with 1-3 images.",
+    parameters: { aspectRatio: ["16:9", "9:16"], durationSeconds: [4, 6, 8, 10], images: { min: 0, max: 3 } } },
+];
+
+const ASPECT_LABELS = {
+  "16:9": "16:9 横屏", "9:16": "9:16 竖屏", "1:1": "1:1 方图", "4:3": "4:3 横屏", "3:4": "3:4 竖屏",
+};
+const IMAGE_SIZE_LABELS = { "1k": "默认 (1k)", "2k": "2K", "4k": "4K" };
+const IMAGE_MODE_LABELS = { "": "自动（按图片数量）", "frames": "首帧 / 首尾帧", "reference": "多图参考" };
 
 function applyFallbackModels(reason) {
   console.warn("使用内置候选模型列表:", reason);
-  ALL_MODELS = { ...FALLBACK_MODELS };
-  renderSidebar();
+  if (document.getElementById("showFull").checked) {
+    BASE_MODELS = {};
+    ALL_MODELS = { ...FALLBACK_MODELS };
+    renderSidebar();
+  } else {
+    ALL_MODELS = {};
+    BASE_MODELS = Object.fromEntries(FALLBACK_BASE.map(m => [m.id, m]));
+    renderBaseSidebar();
+  }
 }
 
 async function loadModels() {
@@ -231,7 +275,8 @@ async function loadModels() {
     return;
   }
   try {
-    const resp = await fetch(`${baseUrl}/v1/models`, {
+    const full = document.getElementById("showFull").checked;
+    const resp = await fetch(`${baseUrl}/v1/models${full ? "?full=1" : ""}`, {
       headers: { "Authorization": `Bearer ${apiKey}` }
     });
     if (!resp.ok) {
@@ -243,9 +288,16 @@ async function loadModels() {
       applyFallbackModels("empty_model_catalog");
       return;
     }
-    ALL_MODELS = {};
-    items.forEach(m => { ALL_MODELS[m.id] = m.description; });
-    renderSidebar();
+    if (!full && items.every(m => m.parameters)) {
+      ALL_MODELS = {};
+      BASE_MODELS = Object.fromEntries(items.map(m => [m.id, m]));
+      renderBaseSidebar();
+    } else {
+      BASE_MODELS = {};
+      ALL_MODELS = {};
+      items.forEach(m => { ALL_MODELS[m.id] = m.description; });
+      renderSidebar();
+    }
   } catch (e) {
     console.error("加载模型失败:", e);
     applyFallbackModels(e.message || "load_failed");
@@ -254,6 +306,104 @@ async function loadModels() {
 
 function renderSidebarFallback() {
   applyFallbackModels("legacy_fallback");
+}
+
+// 基础模型侧边栏：图片 / 视频两组，尺寸、画幅、时长在右侧“生成参数”里选
+function renderBaseSidebar() {
+  const sidebar = document.getElementById("modelSidebar");
+  sidebar.innerHTML = "";
+  const entries = Object.values(BASE_MODELS);
+  if (!entries.length) {
+    sidebar.innerHTML = '<div class="model-section"><div class="model-list" style="border-radius:8px;"><div class="model-item" style="cursor:default;color:#888;">未获取到可用模型，请检查 API Key 或稍后重试</div></div></div>';
+    return;
+  }
+  [["图片", "image"], ["视频", "video"]].forEach(([title, type]) => {
+    const models = entries.filter(m => m.type === type);
+    if (!models.length) return;
+    const section = document.createElement("div");
+    section.className = "model-section";
+    const head = document.createElement("div");
+    head.className = "section-title";
+    head.innerHTML = `<span>${title} (${models.length})</span><span class="arrow">▼</span>`;
+    const list = document.createElement("div");
+    list.className = "model-list";
+    models.forEach(m => {
+      const item = document.createElement("div");
+      item.className = "model-item";
+      item.dataset.model = m.id;
+      item.title = m.description || m.id;
+      item.innerHTML = `<span>${m.id}</span><span class="model-tag ${type === "image" ? "tag-image" : "tag-video"}">${type === "image" ? "图片" : "视频"}</span>`;
+      item.onclick = () => selectModel(m.id);
+      list.appendChild(item);
+    });
+    head.onclick = () => { head.classList.toggle("collapsed"); list.classList.toggle("hidden"); };
+    section.appendChild(head);
+    section.appendChild(list);
+    sidebar.appendChild(section);
+  });
+}
+
+function makeParamSelect(id, label, options, defaultValue, labels) {
+  const wrap = document.createElement("label");
+  wrap.className = "param-item";
+  const caption = document.createElement("span");
+  caption.textContent = label;
+  const select = document.createElement("select");
+  select.id = id;
+  options.forEach(value => {
+    const opt = document.createElement("option");
+    opt.value = String(value);
+    opt.textContent = (labels && labels[value]) || String(value);
+    if (String(value) === String(defaultValue)) opt.selected = true;
+    select.appendChild(opt);
+  });
+  wrap.appendChild(caption);
+  wrap.appendChild(select);
+  return wrap;
+}
+
+// 按基础模型的 parameters 生成参数控件；具体模型名（兼容模式）不显示
+function renderParamFields(entry) {
+  const group = document.getElementById("paramGroup");
+  const fields = document.getElementById("paramFields");
+  const hint = document.getElementById("paramHint");
+  fields.innerHTML = "";
+  hint.textContent = "";
+  if (!entry) { group.style.display = "none"; return; }
+  const p = entry.parameters || {};
+  if (entry.type === "image") {
+    if (p.aspectRatio) fields.appendChild(makeParamSelect("paramAspect", "画幅 aspectRatio", p.aspectRatio, "16:9", ASPECT_LABELS));
+    if (p.imageSize) fields.appendChild(makeParamSelect("paramImageSize", "清晰度 imageSize", p.imageSize, "1k", IMAGE_SIZE_LABELS));
+    hint.textContent = "对应请求参数 generationConfig.imageConfig.{aspectRatio, imageSize}；OpenAI 风格的 size / quality 也支持。";
+  } else {
+    if (p.aspectRatio) fields.appendChild(makeParamSelect("paramAspect", "画幅 aspectRatio", p.aspectRatio, "16:9", ASPECT_LABELS));
+    if (p.durationSeconds) fields.appendChild(makeParamSelect("paramDuration", "时长（秒）durationSeconds", p.durationSeconds, 8));
+    if (p.imageMode) fields.appendChild(makeParamSelect("paramImageMode", "图片用法 imageMode", ["", ...p.imageMode], "", IMAGE_MODE_LABELS));
+    hint.textContent = "对应请求参数 generationConfig.videoConfig.{aspectRatio, durationSeconds, imageMode}；首尾帧只支持 4 / 6 秒，多图参考固定 8 秒。";
+  }
+  group.style.display = "block";
+}
+
+// 读取当前参数控件 → generationConfig（具体模型名时返回 null）
+function collectGenerationConfig() {
+  if (!STATE.baseEntry) return null;
+  const val = id => { const el = document.getElementById(id); return el ? el.value : ""; };
+  if (STATE.baseEntry.type === "image") {
+    const imageConfig = {};
+    if (val("paramAspect")) imageConfig.aspectRatio = val("paramAspect");
+    if (val("paramImageSize") && val("paramImageSize") !== "1k") imageConfig.imageSize = val("paramImageSize");
+    return { imageConfig };
+  }
+  const videoConfig = {};
+  if (val("paramAspect")) videoConfig.aspectRatio = val("paramAspect");
+  if (val("paramDuration")) videoConfig.durationSeconds = parseInt(val("paramDuration"), 10);
+  if (val("paramImageMode")) videoConfig.imageMode = val("paramImageMode");
+  return { videoConfig };
+}
+
+function metaFromBase(entry) {
+  const images = (entry.parameters && entry.parameters.images) || { min: 0, max: 0 };
+  return { type: entry.type, supportsImages: images.max > 0, minImages: images.min || 0, maxImages: images.max || 0 };
 }
 
 function getModelType(modelId) {
@@ -363,8 +513,10 @@ function renderSidebar() {
 
 function selectModel(modelId) {
   STATE.selectedModel = modelId;
-  STATE.modelConfig = getModelMeta(modelId);
+  STATE.baseEntry = BASE_MODELS[modelId] || null;
+  STATE.modelConfig = STATE.baseEntry ? metaFromBase(STATE.baseEntry) : getModelMeta(modelId);
   STATE.images = [];
+  renderParamFields(STATE.baseEntry);
 
   // Update sidebar active state
   document.querySelectorAll(".model-item").forEach(el => {
@@ -373,7 +525,7 @@ function selectModel(modelId) {
 
   // Update panel
   document.getElementById("selectedModelName").textContent = modelId;
-  let info = ALL_MODELS[modelId] || "";
+  let info = (STATE.baseEntry ? STATE.baseEntry.description : ALL_MODELS[modelId]) || "";
   if (/-extend-/.test(modelId)) info += "（续写需要已有视频作为输入，此测试页暂不支持传入源视频）";
   document.getElementById("selectedModelInfo").textContent = info;
 
@@ -488,9 +640,12 @@ async function generate() {
   const messages = [{ role: "user", content: content.length === 1 ? prompt : content }];
 
   const body = { model: STATE.selectedModel, messages, stream: true };
+  const generationConfig = collectGenerationConfig();
+  if (generationConfig) body.generationConfig = generationConfig;
 
   const startTime = Date.now();
   appendLog(`[${new Date().toLocaleTimeString()}] 模型: ${STATE.selectedModel}\n`);
+  if (body.generationConfig) appendLog(`[${new Date().toLocaleTimeString()}] 参数: ${JSON.stringify(body.generationConfig)}\n`);
   appendLog(`[${new Date().toLocaleTimeString()}] 提示词: ${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}\n`);
   appendLog(`[${new Date().toLocaleTimeString()}] 开始请求...\n`);
 
@@ -607,6 +762,7 @@ function renderResult(content) {
   baseUrlInput.value = window.location.origin;
   baseUrlInput.addEventListener("change", loadModels);
   apiKeyInput.addEventListener("change", loadModels);
+  document.getElementById("showFull").addEventListener("change", loadModels);
   loadModels();
 })();
 </script>

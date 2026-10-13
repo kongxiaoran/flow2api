@@ -739,6 +739,14 @@ def resolve_model_name(
         )
         return model
 
+    # ────── 公开视频基础模型（veo-3.1-lite / -fast / -quality、omni-1.1-flash）──────
+    # Link 补丁（2026-10-13）：基础名 + 参数（aspectRatio / durationSeconds / 图片数量）→ 具体名。
+    # 不带任何参数且不带图片时等价于原来的 8 秒横屏别名；具体名（如 veo-3.1-fast-6s-portrait）仍可直接调用。
+    if model in PUBLIC_VIDEO_BASE_MODELS:
+        resolved_public = _resolve_public_video_model(model, request, model_config, images)
+        if resolved_public:
+            return resolved_public
+
     # 如果已经是有效的 MODEL_CONFIG key，直接返回
     if model_config and model in model_config:
         return model
@@ -765,3 +773,267 @@ def get_base_model_aliases() -> Dict[str, str]:
         )
 
     return aliases
+
+
+# ──────────────────────────────────────────────────────────────
+# Link 补丁（2026-10-13）：公开基础模型目录
+#
+# /v1/models 默认只列“基础模型”，尺寸 / 画幅 / 时长都是请求参数；具体名字
+# （gemini-3.1-flash-image-portrait-4k、veo-3.1-fast-6s-portrait 等）仍然可以直接调用，
+# 需要时用 /v1/models?full=1 查看完整列表。
+# ──────────────────────────────────────────────────────────────
+PUBLIC_VIDEO_BASE_MODELS: Dict[str, Dict[str, Any]] = {
+    "veo-3.1-lite": {"family": "lite", "label": "Veo 3.1 Lite", "durations": (4, 6, 8)},
+    "veo-3.1-fast": {"family": "fast", "label": "Veo 3.1 Fast", "durations": (4, 6, 8)},
+    "veo-3.1-quality": {"family": "quality", "label": "Veo 3.1 Quality", "durations": (4, 6, 8)},
+    "omni-1.1-flash": {"family": "flash", "label": "Omni 1.1 Flash", "durations": (4, 6, 8, 10)},
+}
+VIDEO_DEFAULT_DURATION = 8
+I2V_DURATIONS = (4, 6)  # 首帧 / 首尾帧（i2v）只有 4s、6s
+R2V_FAMILIES = ("lite", "fast")  # 多图参考（r2v）只有 lite / fast，固定 8s
+ASPECT_DISPLAY = {
+    "landscape": "16:9",
+    "portrait": "9:16",
+    "square": "1:1",
+    "four-three": "4:3",
+    "three-four": "3:4",
+}
+ASPECT_ORDER = ("landscape", "portrait", "square", "four-three", "three-four")
+
+_IMAGE_MODE_ALIASES = {
+    "frames": "frames",
+    "frame": "frames",
+    "first_last": "frames",
+    "first-last": "frames",
+    "first_frame": "frames",
+    "i2v": "frames",
+    "reference": "reference",
+    "references": "reference",
+    "ref": "reference",
+    "r2v": "reference",
+}
+
+
+def _param_sources(request: Any) -> list:
+    """按优先级收集可能放参数的 dict：generationConfig（含 videoConfig/imageConfig）、顶层 extra、extra_body。"""
+    sources: list = []
+
+    def as_dict(obj: Any) -> Optional[Dict[str, Any]]:
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj
+        dump = getattr(obj, "model_dump", None)
+        if callable(dump):
+            try:
+                return dump()
+            except Exception:
+                return None
+        return None
+
+    def add_with_nested(obj: Any) -> None:
+        data = as_dict(obj)
+        if not data:
+            return
+        sources.append(data)
+        for key in ("videoConfig", "video_config", "imageConfig", "image_config"):
+            nested = as_dict(data.get(key))
+            if nested:
+                sources.append(nested)
+
+    if request is None:
+        return sources
+    add_with_nested(getattr(request, "generationConfig", None))
+    extra = getattr(request, "__pydantic_extra__", None) or {}
+    if isinstance(extra, dict):
+        add_with_nested(extra.get("generationConfig"))
+        add_with_nested(extra.get("video_config") or extra.get("videoConfig"))
+        extra_body = extra.get("extra_body") or extra.get("extraBody")
+        if isinstance(extra_body, dict):
+            add_with_nested(extra_body.get("generationConfig"))
+            add_with_nested(extra_body)
+        add_with_nested(extra)
+    return sources
+
+
+def _first_param(sources: list, *keys: str) -> Any:
+    for source in sources:
+        for key in keys:
+            if key in source and source[key] not in (None, ""):
+                return source[key]
+    return None
+
+
+def _normalize_aspect_token(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    token = (
+        value.strip().replace("：", ":").replace("/", ":").replace(" ", "")
+    )
+    if not token:
+        return None
+    return (
+        ASPECT_RATIO_MAP.get(token)
+        or ASPECT_RATIO_MAP.get(token.lower())
+        or ASPECT_RATIO_MAP.get(token.upper())
+    )
+
+
+def _parse_duration_seconds(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = int(round(float(value)))
+        return seconds if seconds > 0 else None
+    if isinstance(value, str):
+        match = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds?)?\s*$", value, re.IGNORECASE)
+        if match:
+            seconds = int(round(float(match.group(1))))
+            return seconds if seconds > 0 else None
+    return None
+
+
+def _nearest_option(value: int, options: tuple) -> int:
+    # 距离相同取较大的（请求 5 秒时给 6 秒，而不是 4 秒）
+    return min(options, key=lambda option: (abs(option - value), -option))
+
+
+def extract_video_params(request: Any) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """从请求里提取视频参数，返回 (aspect, duration_seconds, image_mode)。
+
+    - aspect：landscape / portrait（支持 16:9、9:16、landscape、portrait，以及 OpenAI 风格 size=1280x720）
+    - duration_seconds：durationSeconds / duration_seconds / duration / seconds
+    - image_mode：frames（首帧/首尾帧）或 reference（多图参考）
+    """
+    sources = _param_sources(request)
+
+    aspect = _normalize_aspect_token(
+        _first_param(sources, "aspectRatio", "aspect_ratio", "aspect")
+    )
+    if aspect is None:
+        size_value = _first_param(sources, "size")
+        if isinstance(size_value, str):
+            match = OPENAI_IMAGE_SIZE_RE.match(size_value.strip())
+            if match:
+                aspect = _aspect_from_dimensions(
+                    int(match.group("w")), int(match.group("h")), video_mode=True
+                )
+    if aspect not in ("landscape", "portrait"):
+        aspect = "portrait" if aspect in ("three-four",) else ("landscape" if aspect else None)
+
+    duration = _parse_duration_seconds(
+        _first_param(sources, "durationSeconds", "duration_seconds", "duration", "seconds")
+    )
+
+    mode_raw = _first_param(sources, "imageMode", "image_mode", "referenceMode", "mode")
+    image_mode = (
+        _IMAGE_MODE_ALIASES.get(str(mode_raw).strip().lower()) if mode_raw else None
+    )
+    return aspect, duration, image_mode
+
+
+def _resolve_public_video_model(
+    model: str, request: Any, model_config: Optional[Dict[str, Any]], images: Any
+) -> Optional[str]:
+    meta = PUBLIC_VIDEO_BASE_MODELS[model]
+    family = meta["family"]
+    durations = meta["durations"]
+    aspect, duration, image_mode = extract_video_params(request)
+
+    image_count = len(images) if images else 0
+    if aspect is None:
+        aspect = _infer_aspect_ratio_from_images(images, video_mode=True) if image_count else None
+    if aspect not in ("landscape", "portrait"):
+        aspect = "landscape"
+
+    if family == "flash":
+        # Omni 同一个具体名同时覆盖文生视频与参考图视频（0～3 张），按时长与画幅选名即可
+        seconds = _nearest_option(duration or VIDEO_DEFAULT_DURATION, durations)
+        resolved = f"omni-1.1-flash-{seconds}s-{aspect}"
+    elif image_count == 0:
+        seconds = _nearest_option(duration or VIDEO_DEFAULT_DURATION, durations)
+        resolved = f"{model}-{seconds}s-{aspect}"
+    elif image_mode == "reference" or image_count >= 3:
+        ref_family = family if family in R2V_FAMILIES else "fast"
+        resolved = f"veo-3.1-{ref_family}-r2v-8s-{aspect}"
+    else:
+        seconds = _nearest_option(duration or max(I2V_DURATIONS), I2V_DURATIONS)
+        resolved = f"veo-3.1-{family}-i2v-{seconds}s-{aspect}"
+
+    if model_config and resolved not in model_config:
+        debug_logger.log_warning(
+            f"[MODEL_RESOLVER] 视频模型 {model} 解析出的 {resolved} 不在 MODEL_CONFIG 中，回退到原始模型名"
+        )
+        return None
+    debug_logger.log_info(
+        f"[MODEL_RESOLVER] 视频模型名转换: {model} → {resolved} "
+        f"(aspect={aspect}, duration={duration or 'default'}, images={image_count}, mode={image_mode or 'auto'})"
+    )
+    return resolved
+
+
+def get_public_model_catalog(model_config: Dict[str, Any]) -> list:
+    """返回对外公开的基础模型（含参数说明）。只包含当前 MODEL_CONFIG 里真实可用且 listed 的模型。"""
+
+    def available(model_id: str) -> bool:
+        cfg = model_config.get(model_id)
+        return bool(cfg) and cfg.get("listed", True)
+
+    entries: list = []
+
+    for alias, base in IMAGE_BASE_MODELS.items():
+        aspects = [a for a in ASPECT_ORDER if available(f"{base}-{a}")]
+        if not aspects:
+            continue
+        sizes = ["1k"] + [
+            size
+            for size in MODEL_SUPPORTED_SIZES.get(base, [])
+            if available(f"{base}-{aspects[0]}-{size}")
+        ]
+        ratios = [ASPECT_DISPLAY[a] for a in aspects]
+        entries.append(
+            {
+                "id": alias,
+                "type": "image",
+                "description": (
+                    f"Flow image generation. Params: aspectRatio {'|'.join(ratios)} (default 16:9); "
+                    f"imageSize {'|'.join(sizes)} (default 1k); OpenAI size/quality are also accepted. "
+                    f"Image input: 0-5 images (image-to-image)."
+                ),
+                "parameters": {
+                    "aspectRatio": ratios,
+                    "imageSize": sizes,
+                    "images": {"min": 0, "max": 5},
+                },
+            }
+        )
+
+    for alias, meta in PUBLIC_VIDEO_BASE_MODELS.items():
+        if not available(f"{alias}-{VIDEO_DEFAULT_DURATION}s-landscape"):
+            continue
+        durations = [d for d in meta["durations"] if available(f"{alias}-{d}s-landscape")]
+        parameters: Dict[str, Any] = {
+            "aspectRatio": ["16:9", "9:16"],
+            "durationSeconds": durations,
+            "images": {"min": 0, "max": 3},
+        }
+        if meta["family"] == "flash":
+            note = "Text-to-video, or reference-image video with 1-3 images."
+        else:
+            parameters["imageMode"] = ["frames", "reference"]
+            note = (
+                "Text-to-video; with 1-2 images: first/last-frame video (4|6s); "
+                "with 3 images or imageMode=reference: reference video (8s, lite/fast only)."
+            )
+        entries.append(
+            {
+                "id": alias,
+                "type": "video",
+                "description": (
+                    f"{meta['label']} video generation. Params: aspectRatio 16:9|9:16 (default 16:9); "
+                    f"durationSeconds {'|'.join(str(d) for d in durations)} (default {VIDEO_DEFAULT_DURATION}). {note}"
+                ),
+                "parameters": parameters,
+            }
+        )
+    return entries
