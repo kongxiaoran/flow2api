@@ -1,5 +1,7 @@
 import base64
 import json
+import struct
+import zlib
 
 import pytest
 from fastapi import FastAPI
@@ -15,6 +17,22 @@ from src.core.model_resolver import (
 from src.services.generation_handler import MODEL_CONFIG
 
 PNG = b"\x89PNG\r\n\x1a\nfake-image-bytes"
+
+
+def real_png(width, height):
+    """生成一张真实可解码的纯色 PNG（不依赖 Pillow）。"""
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + b"\x80\x80\x80" * width for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
 IMAGE_URL = "https://flow-content.google/image/abc?Expires=1&Signature=x"
 
 
@@ -240,3 +258,28 @@ def test_edits_json_with_data_url_and_missing_image(client):
     assert ok.status_code == 200 and client.calls[-1]["images"] == 1
     missing = client.post("/v1/images/edits", json={"prompt": "x"})
     assert missing.status_code == 400 and missing.json()["error"]["param"] == "image"
+
+
+def test_image_aspect_follows_reference_image_when_not_specified():
+    # 需要 Pillow：没有显式画幅时，按输入图比例推断（上游已有逻辑，之前因镜像缺 Pillow 静默失效）
+    assert resolve("gemini-3.1-flash-image", None, [real_png(60, 108)]) == "gemini-3.1-flash-image-portrait"
+    assert resolve("gemini-3.1-flash-image", None, [real_png(108, 60)]) == "gemini-3.1-flash-image-landscape"
+    assert resolve("gemini-3.1-flash-image", None, [real_png(80, 80)]) == "gemini-3.1-flash-image-square"
+    assert resolve("veo-3.1-fast", None, [real_png(60, 108)]) == "veo-3.1-fast-i2v-6s-portrait"
+
+
+def test_edits_without_size_keeps_input_image_shape(client):
+    resp = client.post(
+        "/v1/images/edits",
+        data={"prompt": "x"},
+        files=[("image", ("a.png", real_png(60, 108), "image/png"))],
+    )
+    assert resp.status_code == 200
+    assert resp.headers["x-flow2api-model"] == "gemini-3.1-flash-image-portrait"
+    # 显式 size 优先于输入图比例
+    explicit = client.post(
+        "/v1/images/edits",
+        data={"prompt": "x", "size": "1024x1024"},
+        files=[("image", ("a.png", real_png(60, 108), "image/png"))],
+    )
+    assert explicit.headers["x-flow2api-model"] == "gemini-3.1-flash-image-square"
