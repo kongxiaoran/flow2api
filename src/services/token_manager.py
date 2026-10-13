@@ -28,8 +28,9 @@ class TokenManager:
         self._at_validation_cache: dict[int, float] = {}
         self._last_at_refresh_error: dict[int, str] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
-        # Link 补丁（2026-10-12）：Cookie 保活，记录各 Token 上次轮换的时间（单调时钟）
-        self._cookie_keepalive_last: dict[int, float] = {}
+        # Link 补丁（2026-10-12）：Cookie 保活，记录各 Token 上次尝试轮换的时间（unix 时间，落盘；
+        # 重启后不会立刻再轮换，避免连续重启时被 Google 429 限频）
+        self._cookie_keepalive_last: Optional[dict[int, float]] = None
 
     async def _get_token_lock(
         self,
@@ -1135,23 +1136,32 @@ class TokenManager:
         __Secure-*PSIDTS 副本不再更新，过期后 AT 刷新 401、Token 被自动禁用。
         这里模拟浏览器的 RotateCookies，把新值合并写回 tokens.google_cookies。
         """
-        from .cookie_keepalive import keepalive_interval_minutes, log_result, rotate_google_cookies
+        from .cookie_keepalive import (
+            keepalive_interval_minutes,
+            load_state,
+            log_result,
+            rotate_google_cookies,
+            save_state,
+        )
 
         minutes = keepalive_interval_minutes()
         if minutes <= 0:
             return
+        if self._cookie_keepalive_last is None:
+            self._cookie_keepalive_last = load_state()
         tokens = await self.db.get_active_tokens()
-        now_mono = time.monotonic()
         for token in tokens:
             token_id = int(token.id)
             try:
                 if not (token.google_cookies or "").strip():
                     continue
+                now = time.time()
                 last = self._cookie_keepalive_last.get(token_id)
-                if last is not None and now_mono - last < minutes * 60:
+                if last is not None and now - last < minutes * 60:
                     continue
-                # 先记时间：失败也按间隔重试，避免对 Google 连续请求
-                self._cookie_keepalive_last[token_id] = now_mono
+                # 先记时间并落盘：失败也按间隔重试，且重启后不会立刻再请求 Google
+                self._cookie_keepalive_last[token_id] = now
+                save_state(self._cookie_keepalive_last)
 
                 refresh_lock = await self._get_token_lock(
                     self._refresh_locks, self._refresh_lock_guard, token_id
@@ -1177,6 +1187,10 @@ class TokenManager:
                     )
                     if result.get("ok"):
                         await self.db.update_token(token_id, google_cookies=result["raw"])
+                    if result.get("status") == 429:
+                        # Google 限频：多退让一个周期再试
+                        self._cookie_keepalive_last[token_id] = time.time() + minutes * 60
+                        save_state(self._cookie_keepalive_last)
                     log_result(token_id, result)
                     # docker logs 里可见（不依赖 debug 开关），每个 Token 每个间隔最多一行
                     if result.get("ok"):

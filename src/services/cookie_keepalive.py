@@ -14,6 +14,7 @@ Google 会不断轮换 ``__Secure-*PSIDTS`` / ``*PSIDCC`` / ``SIDCC``。浏览�
 import json
 import os
 import time
+from pathlib import Path
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +38,32 @@ def keepalive_interval_minutes() -> int:
     if minutes <= 0:
         return 0
     return max(2, min(240, minutes))
+
+
+def default_state_path() -> Path:
+    """上次轮换时间的落盘位置（与 SQLite 同目录 /app/data，容器重建后仍在）。"""
+    return Path(__file__).resolve().parents[2] / "data" / "cookie_keepalive_state.json"
+
+
+def load_state(path: Optional[Path] = None) -> Dict[int, float]:
+    """读取 {token_id: 上次尝试轮换的 unix 时间}；文件不存在或损坏时返回空。"""
+    try:
+        raw = json.loads((path or default_state_path()).read_text(encoding="utf-8"))
+        return {int(key): float(value) for key, value in raw.items()}
+    except Exception:
+        return {}
+
+
+def save_state(state: Dict[int, float], path: Optional[Path] = None) -> None:
+    """原子写入；失败只记日志，不影响保活本身。"""
+    target = path or default_state_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps({str(k): v for k, v in state.items()}), encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception as exc:
+        debug_logger.log_warning(f"[COOKIE_KEEPALIVE] 保存状态失败: {exc}")
 
 
 def _domain_key(domain: Any) -> str:
@@ -193,7 +220,11 @@ async def rotate_google_cookies(
         return {"ok": False, "error": f"请求 RotateCookies 异常: {exc}"}
 
     if response.status_code != 200:
-        return {"ok": False, "error": f"RotateCookies 返回 HTTP {response.status_code}"}
+        return {
+            "ok": False,
+            "status": response.status_code,
+            "error": f"RotateCookies 返回 HTTP {response.status_code}",
+        }
     rotated = [
         item
         for item in (parse_set_cookie(line) for line in _set_cookie_lines(response.headers))

@@ -141,3 +141,94 @@ def test_rotate_skips_non_json_and_missing_session():
     assert _run(ck.rotate_google_cookies("SID=1; HSID=2"))["ok"] is False
     only_flow = [c for c in _stored() if c["domain"] == "flow.google.com"]
     assert _run(ck.rotate_google_cookies(json.dumps(only_flow)))["ok"] is False
+
+
+def test_state_roundtrip_and_corruption(tmp_path):
+    path = tmp_path / "state.json"
+    assert ck.load_state(path) == {}  # 不存在
+    ck.save_state({2: 1791850000.5, 7: 1.0}, path)
+    assert ck.load_state(path) == {2: 1791850000.5, 7: 1.0}
+    path.write_text("{not json", encoding="utf-8")
+    assert ck.load_state(path) == {}  # 损坏时不抛异常
+
+
+def test_rate_limited_result_carries_status(monkeypatch):
+    monkeypatch.setattr(ck, "AsyncSession", _FakeSession)
+    _FakeSession.response = _FakeResponse(429, [])
+    result = _run(ck.rotate_google_cookies(json.dumps(_stored())))
+    assert result["ok"] is False and result["status"] == 429
+
+
+class _FakeDB:
+    def __init__(self, token):
+        self.token = token
+        self.updated = []
+
+    async def get_active_tokens(self):
+        return [self.token]
+
+    async def get_token(self, token_id):
+        return self.token
+
+    async def update_token(self, token_id, **fields):
+        self.updated.append(fields)
+
+
+def _manager(monkeypatch, tmp_path, result):
+    import types
+
+    from src.services import token_manager as tm
+
+    monkeypatch.setenv("FLOW_COOKIE_KEEPALIVE_MINUTES", "30")
+    monkeypatch.setattr(ck, "default_state_path", lambda: tmp_path / "state.json")
+
+    async def fake_rotate(raw, proxy=None):
+        fake_rotate.calls += 1
+        return result
+
+    fake_rotate.calls = 0
+    monkeypatch.setattr(ck, "rotate_google_cookies", fake_rotate)
+    token = types.SimpleNamespace(
+        id=2, is_active=True, google_cookies=json.dumps(_stored()), proxy_url=""
+    )
+    manager = tm.TokenManager.__new__(tm.TokenManager)  # 不初始化数据库 / flow_client
+    import asyncio
+
+    manager.db = _FakeDB(token)
+    manager.flow_client = types.SimpleNamespace(proxy_manager=None)
+    manager._refresh_lock_guard = asyncio.Lock()
+    manager._refresh_locks = {}
+    manager._cookie_keepalive_last = None
+    return manager, fake_rotate
+
+
+def test_keepalive_does_not_rotate_again_right_after_restart(monkeypatch, tmp_path):
+    import time
+
+    ck.save_state({2: time.time() - 60}, tmp_path / "state.json")  # 1 分钟前刚轮换过
+    manager, fake_rotate = _manager(monkeypatch, tmp_path, {"ok": True, "raw": "[]", "rotated": ["SIDCC"]})
+    _run(manager.run_cookie_keepalive_once())
+    assert fake_rotate.calls == 0 and manager.db.updated == []
+
+
+def test_keepalive_rotates_when_due_and_persists(monkeypatch, tmp_path):
+    import time
+
+    ck.save_state({2: time.time() - 31 * 60}, tmp_path / "state.json")  # 已超过 30 分钟
+    manager, fake_rotate = _manager(monkeypatch, tmp_path, {"ok": True, "raw": "[1]", "rotated": ["__Secure-1PSIDTS"]})
+    _run(manager.run_cookie_keepalive_once())
+    assert fake_rotate.calls == 1 and manager.db.updated == [{"google_cookies": "[1]"}]
+    assert time.time() - ck.load_state(tmp_path / "state.json")[2] < 5  # 时间已落盘
+
+
+def test_keepalive_backs_off_one_extra_interval_on_429(monkeypatch, tmp_path):
+    import time
+
+    manager, fake_rotate = _manager(
+        monkeypatch, tmp_path, {"ok": False, "status": 429, "error": "RotateCookies 返回 HTTP 429"}
+    )
+    _run(manager.run_cookie_keepalive_once())  # 没有状态文件：立即尝试一次
+    assert fake_rotate.calls == 1 and manager.db.updated == []  # 失败不写库
+    assert ck.load_state(tmp_path / "state.json")[2] > time.time() + 29 * 60  # 退让到下下个周期
+    _run(manager.run_cookie_keepalive_once())
+    assert fake_rotate.calls == 1  # 退让期内不再请求
